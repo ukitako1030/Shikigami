@@ -1,0 +1,38 @@
+# Replace the example paths with your clone location. Merge into your existing Codex config.
+[mcp_servers.shikigami]
+command = 'node'
+args = ['C:\path\to\Shikigami\src\mcp.mjs']
+cwd = 'C:\path\to\Shikigami'
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+# Non-read-only operations ask for approval. Configure automatic approval only by your own choice.
+default_tools_approval_mode = "writes"
+enabled_tools = [
+  "shikigami_workspace",
+  "browser_close",
+  "browser_resize",
+  "browser_console_messages",
+  "browser_emulate_media",
+  "browser_find",
+  "browser_fill_form",
+  "browser_press_key",
+  "browser_type",
+  "browser_mouse_move_xy",
+  "browser_mouse_click_xy",
+  "browser_mouse_drag_xy",
+  "browser_mouse_down",
+  "browser_mouse_up",
+  "browser_mouse_wheel",
+  "browser_navigate",
+  "browser_navigate_back",
+  "browser_network_requests",
+  "browser_network_request",
+  "browser_take_screenshot",
+  "browser_snapshot",
+  "browser_click",
+  "browser_drag",
+  "browser_hover",
+  "browser_select_option",
+  "browser_tabs",
+  "browser_wait_for",
+]

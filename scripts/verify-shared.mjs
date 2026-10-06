@@ -1,0 +1,78 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const temp=await fs.mkdtemp(path.join(os.tmpdir(),'shikigami-test-'));
+process.env.SHIKIGAMI_DATA_DIR=path.join(temp,'data');
+process.env.SHIKIGAMI_CODEX_CONFIG=path.join(temp,'config.toml');
+const {ensureService}=await import('../src/service.mjs');
+const originalConfig='model = "gpt-6.1-sol"\n[mcp_servers.other]\ncommand = "other"\n';
+await fs.writeFile(process.env.SHIKIGAMI_CODEX_CONFIG,originalConfig);
+const service=await ensureService();
+const clients=[];
+async function api(method,route,body){const response=await fetch(service.base+route,{method,headers:{'X-Shikigami-Token':service.token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});const type=response.headers.get('content-type');return {status:response.status,body:type?.includes('application/json')?await response.json():await response.arrayBuffer()};}
+async function connect(){const client=new Client({name:'shikigami-shared-test',version:'1.0.0'});const transport=new StdioClientTransport({command:process.execPath,args:[path.join(root,'src','mcp.mjs')],cwd:root,env:{...process.env},stderr:'pipe'});await client.connect(transport);clients.push(client);return client;}
+try{
+  assert.equal((await fetch(service.base+'/api/status')).status,403);
+  assert.equal((await fetch(service.base+'/api/status',{headers:{'X-Shikigami-Token':service.token,Origin:'https://example.invalid'}})).status,403);
+  const first=await connect(),second=await connect();
+  const tools=(await first.listTools()).tools;
+  assert(tools.length>=27 && tools.length<=28);
+  for(const forbidden of ['browser_run_code','browser_run_code_unsafe','browser_evaluate','browser_file_upload','browser_drop','browser_handle_dialog'])assert(!tools.some(tool=>tool.name===forbidden));
+  const one=await first.callTool({name:'shikigami_workspace',arguments:{}});
+  const two=await second.callTool({name:'shikigami_workspace',arguments:{}});
+  assert.equal(JSON.parse(one.content[0].text).panel,JSON.parse(two.content[0].text).panel);
+  assert.equal((await api('GET','/api/status')).body.agentConnections,2);
+  assert.equal((await api('POST','/api/capture',{})).status,409);
+  const html='<!doctype html><meta charset="utf-8"><title>Shared</title><h1>同じブラウザーです</h1><label for="name">名前</label><input id="name"><button onclick="document.querySelector(\'#done\').textContent=document.querySelector(\'#name\').value">記録</button><output id="done"></output>';
+  const nav=await first.callTool({name:'browser_navigate',arguments:{url:'data:text/html,'+encodeURIComponent(html)}});
+  assert(!nav.isError,JSON.stringify(nav));
+  const snapshot=await second.callTool({name:'browser_snapshot',arguments:{}});
+  assert(!snapshot.isError && JSON.stringify(snapshot).includes('同じブラウザーです'));
+  const filled=await second.callTool({name:'browser_fill_form',arguments:{fields:[{target:'#name',name:'名前',type:'textbox',value:'共有確認'}]}});
+  assert(!filled.isError,JSON.stringify(filled));
+  const clicked=await first.callTool({name:'browser_click',arguments:{target:'button'}});
+  assert(!clicked.isError,JSON.stringify(clicked));
+  assert(JSON.stringify(await second.callTool({name:'browser_snapshot',arguments:{}})).includes('共有確認'));
+  assert.equal((await api('POST','/api/capture',{})).status,200);
+  assert.equal((await api('GET','/api/status')).body.hasImage,true);
+  assert.equal((await api('GET','/api/preview')).status,200);
+  assert.equal((await api('POST','/api/stop',{})).body.stopped,true);
+  const rejected=await first.callTool({name:'browser_navigate',arguments:{url:'data:text/html,denied'}});
+  assert.equal(rejected.isError,true);
+  assert.equal((await api('POST','/api/resume',{})).body.stopped,false);
+  const resumed=await second.callTool({name:'browser_navigate',arguments:{url:'data:text/html,resumed'}});
+  assert(!resumed.isError);
+  const waiting=first.callTool({name:'browser_wait_for',arguments:{time:30}});
+  await new Promise(resolve=>setTimeout(resolve,150));
+  const queued=second.callTool({name:'browser_navigate',arguments:{url:'data:text/html,should-not-run'}});
+  await new Promise(resolve=>setTimeout(resolve,50));
+  const stopAt=Date.now();await api('POST','/api/stop',{});
+  assert(Date.now()-stopAt<10000,'Stopping an active wait must not block for the full wait');
+  assert.equal((await waiting).isError,true);
+  assert.equal((await queued).isError,true);
+  await api('POST','/api/resume',{});
+  const deniedConnect=await api('POST','/api/connect-codex',{});
+  assert.equal(deniedConnect.status,400);
+  const connected=await api('POST','/api/connect-codex',{approveBrowserOperations:true});
+  assert.equal(connected.status,200);
+  const config=await fs.readFile(process.env.SHIKIGAMI_CODEX_CONFIG,'utf8');
+  assert(config.includes(originalConfig.trim()) && config.includes('[mcp_servers.shikigami]') && config.includes('[mcp_servers.shikigami.env]'));
+  assert(config.includes('SHIKIGAMI_DATA_DIR'));
+  assert(config.includes('[mcp_servers.shikigami.tools.browser_navigate]\napproval_mode = "approve"'));
+  const unchanged=await api('POST','/api/connect-codex',{approveBrowserOperations:true});
+  assert.equal(unchanged.body.updated,false);
+  assert((await fs.readdir(temp)).some(name=>name.startsWith('config.toml.shikigami-backup-')));
+  await second.callTool({name:'browser_close',arguments:{}});
+  console.log(JSON.stringify({ok:true,toolCount:tools.length,sharedPanel:true,sharedBrowser:true,stopResume:true,authenticated:true,codexConfigIsolated:true}));
+}finally{
+  await Promise.allSettled(clients.map(client=>client.close()));
+  await api('POST','/api/shutdown',{}).catch(()=>{});
+  await new Promise(resolve=>setTimeout(resolve,300));
+  if(path.resolve(temp).startsWith(path.resolve(os.tmpdir())+path.sep) && path.basename(temp).startsWith('shikigami-test-'))await fs.rm(temp,{recursive:true,force:true});
+}
