@@ -8,15 +8,17 @@
     "url": "https://github.com/ukitako1030/Shikigami.git"
   },
   "type": "module",
-  "description": "A dedicated Google Chrome workspace for AI agents on Windows",
+  "description": "Dedicated browser and experimental desktop workspaces for AI agents on Windows",
   "scripts": {
     "start": "node src/desktop-launcher.mjs",
     "start:service": "node src/service.mjs --serve",
     "start:probe": "node src/probe.mjs",
+    "start:desktop": "node src/desktop/service.mjs --start",
     "test": "node src/verify.mjs",
     "test:codex": "node scripts/verify-codex.mjs",
     "test:shared": "node scripts/verify-shared.mjs",
     "test:ui": "node scripts/verify-ui.mjs",
+    "test:desktop": "node scripts/verify-desktop.mjs",
     "inspect:panel": "node scripts/inspect-panel.mjs"
   },
   "engines": {

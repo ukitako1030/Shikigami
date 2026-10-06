@@ -1,0 +1,83 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {chromium} from 'playwright';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+
+const root=fileURLToPath(new URL('../',import.meta.url));
+process.env.SHIKIGAMI_DESKTOP_DATA_DIR=path.join(root,'.runtime',`desktop-test-${Date.now()}`);
+process.env.SHIKIGAMI_CODEX_CONFIG=path.join(process.env.SHIKIGAMI_DESKTOP_DATA_DIR,'codex-test.toml');
+await fs.mkdir(process.env.SHIKIGAMI_DESKTOP_DATA_DIR,{recursive:true});
+const unrelated='model = "preserve-this"\n\n[mcp_servers.unrelated]\ncommand = "untouched"\n';
+await fs.writeFile(process.env.SHIKIGAMI_CODEX_CONFIG,unrelated);
+const {ensureDesktopService}=await import('../src/desktop/service.mjs');
+const session=await ensureDesktopService();
+const pause=ms=>new Promise(r=>setTimeout(r,ms));
+async function api(route,body){const r=await fetch(session.base+'/api/'+route,{method:body===undefined?'GET':'POST',headers:{'X-Shikigami-Token':session.token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});const value=await r.json();if(!r.ok)throw new Error(JSON.stringify(value));return value;}
+async function until(predicate){for(let i=0;i<160;i++){const s=await api('status');if(predicate(s))return s;await pause(250);}throw new Error('Desktop state timed out');}
+const clients=[],errors=[];let browser;
+const result={startedAt:new Date().toISOString(),humanConcurrencyVerified:false};
+try{
+  assert.equal((await fetch(session.base+'/api/status')).status,403);
+  assert.equal((await fetch(session.base+'/api/status',{headers:{'X-Shikigami-Token':session.token,Origin:'https://untrusted.example'}})).status,403);
+  for(let i=0;i<2;i++){
+    const client=new Client({name:'desktop-test-'+i,version:'1'});
+    await client.connect(new StdioClientTransport({command:process.execPath,args:[path.join(root,'src','desktop','mcp.mjs')],env:{...process.env},stderr:'pipe'}));clients.push(client);
+  }
+  const list=await clients[0].listTools();assert.equal(list.tools.length,10);result.mcpTools=list.tools.map(t=>t.name);
+  assert.equal((await api('status')).connections,2);
+  const call=async(name,args={},index=0)=>{const r=await clients[index].callTool({name,arguments:args});assert(!r.isError,JSON.stringify(r));return r;};
+  const one=await call('desktop_workspace'),two=await call('desktop_workspace',{},1);assert.equal(JSON.parse(one.content[0].text).panel,JSON.parse(two.content[0].text).panel);
+  await call('desktop_start');await call('desktop_launch',{app:'editor'});
+  await call('desktop_click',{x:220,y:180});
+  await call('desktop_type',{text:'MCP経由の日本語入力。\n専用デスクトップで保存します。\n'},1);
+  await call('desktop_key',{key:'ctrl+s'});
+  const shot=await call('desktop_screenshot');assert(shot.content.some(c=>c.type==='image'));
+  assert((await clients[0].callTool({name:'desktop_click',arguments:{x:-1,y:1}})).isError);
+  await fs.mkdir(path.join(root,'artifacts'),{recursive:true});
+  await fs.writeFile(path.join(root,'artifacts','desktop-mcp.png'),Buffer.from(shot.content.find(c=>c.type==='image').data,'base64'));
+  result.mcpSharedDesktop=true;
+  browser=await chromium.launch({channel:'chrome',headless:true});
+  const page=await browser.newPage({viewport:{width:1440,height:1000}});
+  page.on('pageerror',e=>errors.push(e.message));
+  let captures=0;page.on('request',r=>{if(r.url().endsWith('/api/capture'))captures++;});
+  await page.goto(session.panel);await page.getByText('Linuxデスクトップが待機中',{exact:true}).waitFor();
+  await page.locator('[data-page="connect"]').click();
+  assert(await page.locator('#connect-button').isDisabled());
+  await page.locator('#connect-approve').check();await page.locator('#connect-button').click();
+  await page.locator('#connect-message').filter({hasText:'設定を追加しました'}).waitFor();
+  const configured=await fs.readFile(process.env.SHIKIGAMI_CODEX_CONFIG,'utf8');
+  assert(configured.startsWith(unrelated.trimEnd()));
+  assert(configured.includes('[mcp_servers.shikigami_desktop.tools.desktop_type]'));
+  assert.equal((await api('connect-codex',{approveDesktopOperations:true})).updated,false);
+  await assert.rejects(()=>api('connect-codex',{}));result.isolatedConfigPreserved=true;
+  await page.locator('[data-page="home"]').click();
+  await page.screenshot({path:path.join(root,'artifacts','desktop-panel-hidden.png'),fullPage:true});
+  await page.locator('#demo').click();
+  const tested=await until(s=>s.lastReport&&!s.busy);assert(tested.lastReport.success,JSON.stringify(tested.lastReport));assert(tested.lastReport.savedVerified);result.demo=tested.lastReport;
+  await page.locator('#show').click();await page.locator('#screen:visible').waitFor();
+  await page.screenshot({path:path.join(root,'artifacts','desktop-panel.png'),fullPage:true});
+  await page.locator('#manual-toggle').check();
+  await page.locator('[data-app="editor"]').click();await page.locator('#manual-message').filter({hasText:'操作を送りました'}).waitFor();
+  await page.locator('#send-text').fill('手動パネルから送信。');await page.locator('#type-text').click();
+  await page.locator('#save-key').click();
+  await page.locator('#hide').click();await pause(400);const count=captures;await pause(3300);assert.equal(captures,count,'Hidden preview must not poll screenshots');
+  await page.setViewportSize({width:390,height:844});await page.screenshot({path:path.join(root,'artifacts','desktop-mobile.png'),fullPage:true});
+  assert(!await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),'Mobile horizontal overflow');
+  await page.setViewportSize({width:1366,height:768});await page.screenshot({path:path.join(root,'artifacts','desktop-small.png'),fullPage:true});
+  assert(!await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),'Desktop horizontal overflow');
+  await page.setViewportSize({width:800,height:900});await page.screenshot({path:path.join(root,'artifacts','desktop-medium.png'),fullPage:true});
+  assert((await page.locator('.status-row').boundingBox()).width>180,'Middle-width status column must remain readable');
+  await api('demo',{seconds:60});await pause(700);const stopAt=Date.now();await api('stop',{});assert(Date.now()-stopAt<10000);
+  const cancelled=await until(s=>s.lastReport?.cancelled&&!s.running);assert(cancelled.lastReport.cancelled);result.stopCancelsDemo=true;
+  assert((await clients[0].callTool({name:'desktop_type',arguments:{text:'must be refused'}})).isError);
+  await call('desktop_start');await call('desktop_launch',{app:'calculator'});await call('desktop_stop');
+  assert.equal((await api('status')).running,false);result.restart=true;
+  for(const client of clients)await client.close();
+  await api('shutdown',{});await page.getByText('アプリに接続できません',{exact:true}).waitFor();
+  assert.deepEqual(errors,[]);result.ok=true;result.ui={previewOptIn:true,hiddenPreviewDoesNotPoll:true,manualControls:true,mobile:true,offline:true};
+  await fs.writeFile(path.join(root,'artifacts','desktop-test.json'),JSON.stringify(result,null,2));
+  console.log(JSON.stringify(result,null,2));
+}finally{for(const client of clients)await client.close().catch(()=>{});await browser?.close();await api('shutdown',{}).catch(()=>{});}
