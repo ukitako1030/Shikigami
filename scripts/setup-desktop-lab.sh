@@ -24,6 +24,14 @@ if ! command -v google-chrome-stable >/dev/null 2>&1; then
   test "$(dpkg-deb -f "$package" Architecture)" = amd64
   apt-get install -y --no-install-recommends "$package"
 fi
+# Managed policy read by Google Chrome (google-chrome-stable from Google's .deb) in this distro.
+# It blocks file:// so the dedicated Chrome cannot open Windows files under /mnt/c by URL.
+# Linux apps' file dialogs can still reach /mnt/c: this is not a sandbox.
+policy=/etc/opt/chrome/policies/managed
+install -d -m 0755 /etc/opt/chrome /etc/opt/chrome/policies "$policy"
+printf '%s\n' '{"URLBlocklist":["file://*"]}' >"$policy/shikigami-lab.json.tmp"
+chmod 0644 "$policy/shikigami-lab.json.tmp"
+mv -f "$policy/shikigami-lab.json.tmp" "$policy/shikigami-lab.json"
 if ! id shikigami-lab >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /var/lib/shikigami-lab \
     --shell /usr/sbin/nologin shikigami-lab

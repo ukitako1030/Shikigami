@@ -395,14 +395,29 @@ def dispatch(command):
         text = command.get('text')
         if not isinstance(text, str) or len(text) > 10000 or '\x00' in text:
             raise ValueError('Invalid text')
+        if not text:
+            return {'ok': True}
         # Clipboard belongs exclusively to this private X display, never to Windows/WSLg.
+        expected = text.encode('utf-8')
         clipboard = subprocess.Popen(['xclip', '-quiet', '-selection', 'clipboard', '-loops', '0'],
                                      env=env, stdin=subprocess.PIPE, stdout=log, stderr=log,
                                      start_new_session=True, preexec_fn=parent_death)
         children.append(clipboard)
-        clipboard.stdin.write(text.encode('utf-8'))
+        clipboard.stdin.write(expected)
         clipboard.stdin.close()
-        time.sleep(.08)
+        # Paste only after this text owns the clipboard; otherwise the previous text could be pasted.
+        deadline = time.monotonic() + 1.5
+        while True:
+            try:
+                current = subprocess.run(['xclip', '-o', '-selection', 'clipboard'], env=env,
+                                         capture_output=True, timeout=max(.1, deadline - time.monotonic()))
+                if current.returncode == 0 and current.stdout == expected:
+                    break
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() >= deadline or clipboard.poll() is not None:
+                raise RuntimeError('The private clipboard was not ready, so nothing was pasted. Try again.')
+            time.sleep(.02)
         xdo('key', '--clearmodifiers', 'ctrl+v')
         time.sleep(.15)
     elif method == 'key':

@@ -1,4 +1,5 @@
 import {spawn} from 'node:child_process';
+import {StringDecoder} from 'node:string_decoder';
 import {createInterface} from 'node:readline';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
@@ -9,6 +10,9 @@ function linuxPath(value){
   if(!/^[A-Za-z]:\\/.test(value))throw new Error('WSL prototype requires a local Windows drive path');
   return `/mnt/${value[0].toLowerCase()}/${value.slice(3).replaceAll('\\','/')}`;
 }
+// wsl.exe writes its own messages as UTF-16LE unless WSL_UTF8=1. Decode across chunk boundaries.
+const spawnWorker=(args,stdio)=>spawn(process.platform==='win32'?'wsl.exe':'python3',args,{windowsHide:true,stdio,env:{...process.env,WSL_UTF8:'1'}});
+function decodeText(stream,append){const decoder=new StringDecoder('utf8');stream.on('data',chunk=>append(decoder.write(chunk)));stream.on('end',()=>append(decoder.end()));}
 
 export class DesktopBridge {
   constructor({workspaceKey}={}){
@@ -25,14 +29,15 @@ export class DesktopBridge {
   }
   staticRPC(extra,timeoutMs=30000){
     return new Promise((resolve,reject)=>{
-      const child=spawn(process.platform==='win32'?'wsl.exe':'python3',this.workerArgs(extra),{windowsHide:true,stdio:['ignore','pipe','pipe']});
+      const child=spawnWorker(this.workerArgs(extra),['ignore','pipe','pipe']);
       let chunks=[],bytes=0,error='',settled=false;
       const finish=(failure,value)=>{if(settled)return;settled=true;clearTimeout(timer);failure?reject(failure):resolve(value);};
       child.stdout.on('data',chunk=>{bytes+=chunk.length;if(bytes>30_000_000){child.kill();finish(new Error('ファイルが読み取り上限を超えました'));}else chunks.push(chunk);});
-      child.stderr.on('data',chunk=>{error=(error+chunk.toString()).slice(-2000);});
+      decodeText(child.stderr,text=>{error=(error+text).slice(-2000);});
       const timer=setTimeout(()=>{child.kill();finish(new Error('ファイル一覧の取得がタイムアウトしました'));},timeoutMs);
       child.on('error',e=>finish(e));
-      child.on('exit',code=>{if(code!==0)return finish(new Error(error||'ファイルを読み取れませんでした'));try{finish(null,JSON.parse(Buffer.concat(chunks).toString('utf8')));}catch(e){finish(new Error('ファイル応答を読み取れませんでした: '+e.message));}});
+      // wsl.exe reports its own failures (e.g. missing distro) on stdout.
+      child.on('close',code=>{if(code!==0)return finish(new Error(error.trim()||Buffer.concat(chunks).toString('utf8').trim().slice(-2000)||'ファイルを読み取れませんでした'));try{finish(null,JSON.parse(Buffer.concat(chunks).toString('utf8')));}catch(e){finish(new Error('ファイル応答を読み取れませんでした: '+e.message));}});
     });
   }
   readFiles(){return this.staticRPC(['--read-files']);}
@@ -40,11 +45,9 @@ export class DesktopBridge {
   async start(){
     if(this.child)return this.request({method:'start'});
     if(this.sessionId)await this.stop();
-    const command=process.platform==='win32'?'wsl.exe':'python3';
-    const args=this.workerArgs([],true);
-    const child=spawn(command,args,{windowsHide:true,stdio:['pipe','pipe','pipe']});
+    const child=spawnWorker(this.workerArgs([],true),['pipe','pipe','pipe']);
     this.child=child;this.error='';
-    child.stderr.on('data',chunk=>{this.error=(this.error+chunk.toString()).slice(-2000);});
+    decodeText(child.stderr,text=>{this.error=(this.error+text).slice(-2000);});
     createInterface({input:child.stdout}).on('line',line=>{
       let value;try{value=JSON.parse(line);}catch{this.error=(this.error+line).slice(-2000);return;}
       if(value.event==='ready'&&/^[a-f0-9]{24}$/.test(value.sessionId)){this.sessionId=value.sessionId;return;}
@@ -88,11 +91,11 @@ export class DesktopBridge {
         ?['-d',process.env.SHIKIGAMI_WSL_DISTRO||'Ubuntu-22.04','-u','shikigami-lab','--exec','python3',linuxPath(workerFile),'--cleanup',this.sessionId]
         :[workerFile,'--cleanup',this.sessionId];
       const result=await new Promise((resolve,reject)=>{
-        const p=spawn(process.platform==='win32'?'wsl.exe':'python3',args,{windowsHide:true,stdio:['ignore','pipe','pipe']});
-        let output='',error='';p.stdout.on('data',b=>output+=b);p.stderr.on('data',b=>error+=b);
+        const p=spawnWorker(args,['ignore','pipe','pipe']);
+        const output=[],errors=[];p.stdout.on('data',b=>output.push(b));p.stderr.on('data',b=>errors.push(b));
         const timer=setTimeout(()=>{p.kill();reject(new Error('専用プロセスの終了を確認できませんでした'));},8000);
         p.on('error',e=>{clearTimeout(timer);reject(e);});
-        p.on('exit',code=>{clearTimeout(timer);try{if(code!==0)throw new Error(error||'Cleanup failed');resolve(JSON.parse(output));}catch(e){reject(e);}});
+        p.on('close',code=>{clearTimeout(timer);try{if(code!==0)throw new Error((Buffer.concat(errors).toString('utf8').trim()||Buffer.concat(output).toString('utf8').trim()).slice(-2000)||'Cleanup failed');resolve(JSON.parse(Buffer.concat(output).toString('utf8')));}catch(e){reject(e);}});
       });
       if(result.remaining.length)throw new Error('専用プロセスが残っています：'+result.remaining.join(','));
       this.sessionId=null;

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {execFile} from 'node:child_process';
 import {chromium} from 'playwright';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -17,6 +18,7 @@ const {ensureDesktopService}=await import('../src/desktop/service.mjs');
 const session=await ensureDesktopService();
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function api(route,body){const r=await fetch(session.base+'/api/'+route,{method:body===undefined?'GET':'POST',headers:{'X-Shikigami-Token':session.token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});const value=await r.json();if(!r.ok)throw new Error(JSON.stringify(value));return value;}
+async function asView(token,route,body){return fetch(session.base+'/api/'+route,{method:body===undefined?'GET':'POST',headers:{'X-Shikigami-Token':token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});}
 async function until(predicate){for(let i=0;i<160;i++){const s=await api('status');if(predicate(s))return s;await pause(250);}throw new Error('Desktop state timed out');}
 const clients=[],errors=[];let browser;
 const result={startedAt:new Date().toISOString(),humanConcurrencyVerified:false};
@@ -31,6 +33,10 @@ try{
   assert.equal((await api('status')).connections,2);
   const call=async(name,args={},index=0)=>{const r=await clients[index].callTool({name,arguments:args});assert(!r.isError,JSON.stringify(r));return r;};
   const one=await call('desktop_workspace'),two=await call('desktop_workspace',{},1);assert.equal(JSON.parse(one.content[0].text).panel,JSON.parse(two.content[0].text).panel);
+  // The URL handed to AI agents is the view-only panel and never contains the admin token.
+  const viewUrl=JSON.parse(one.content[0].text).panel;
+  assert.match(viewUrl,/^http:\/\/127\.0\.0\.1:\d+\/view\/[a-f0-9]{48}$/);assert(!JSON.stringify([one,two]).includes(session.token));
+  const viewToken=new URL(viewUrl).pathname.split('/').pop();
   await call('desktop_start');await call('desktop_launch',{app:'editor'});
   await call('desktop_click',{x:220,y:180});
   await call('desktop_type',{text:'MCP経由の日本語入力。\n専用デスクトップで保存します。\n'},1);
@@ -38,8 +44,22 @@ try{
   await pause(200);
   const saved=await call('desktop_read_file',{name:'作業メモ.txt'});assert(saved.content.some(c=>c.text?.includes('MCP経由の日本語入力。')));result.savedFileRead=true;
   const files=await call('desktop_files');assert(JSON.parse(files.content[0].text).files.some(f=>f.name==='作業メモ.txt'));
+  assert.equal((await asView(viewToken,'status')).status,200);
+  const viewFiles=await (await asView(viewToken,'files')).json();assert(viewFiles.files.some(f=>f.name==='作業メモ.txt'&&typeof f.size==='number'&&!('data' in f)));
+  for(const [route,body] of [['connect-codex',{approveDesktopOperations:true}],['export',{name:'作業メモ.txt'}],['file',{name:'作業メモ.txt'}],['action',{method:'key',key:'ctrl+s'}],['start',{}],['confirm',{result:'none'}],['events',{events:[]}],['demo',{seconds:10}],['config'],['mcp/call',{name:'desktop_workspace'}],['shutdown',{}]]){
+    const denied=await asView(viewToken,route,body);assert.equal(denied.status,403,route);
+    for(const [name,value] of [['x-frame-options','DENY'],['content-security-policy',"frame-ancestors 'none'"],['referrer-policy','no-referrer']])assert.equal(denied.headers.get(name),value);
+  }
+  assert.equal(await fs.readFile(process.env.SHIKIGAMI_CODEX_CONFIG,'utf8'),unrelated);
+  assert.equal(await fs.stat(path.join(process.env.SHIKIGAMI_EXPORT_DIR,'作業メモ.txt')).catch(()=>null),null);
+  assert.equal((await fetch(session.base+'/panel/'+viewToken)).status,403);result.viewTokenScoped=true;
   assert((await clients[0].callTool({name:'desktop_read_file',arguments:{name:'../.lock'}})).isError);
   await call('desktop_navigate',{url:'https://example.com/'});await pause(2000);
+  // Setup installs a Chrome policy so the dedicated Chrome cannot open Windows files through file://.
+  if(process.platform==='win32'){
+    const chromeLog=await new Promise(resolve=>execFile('wsl.exe',['-d',process.env.SHIKIGAMI_WSL_DISTRO||'Ubuntu-22.04','-u','shikigami-lab','--cd','/tmp','--exec','sh','-c','d=$(mktemp -d);timeout 60 google-chrome-stable --headless=new --disable-gpu --no-first-run --user-data-dir="$d" --enable-logging=stderr --dump-dom file:///etc/hostname;rm -rf "$d"'],{windowsHide:true,env:{...process.env,WSL_UTF8:'1'},timeout:90000,maxBuffer:4_000_000},(error,stdout,stderr)=>resolve(stdout+stderr)));
+    assert(chromeLog.includes('ERR_BLOCKED_BY_ADMINISTRATOR'),'Chrome file:// policy is missing. Re-run scripts/setup-desktop-lab.sh as root.');result.chromeFileUrlBlocked=true;
+  }
   result.chromeMemory=(await api('status')).memory;
   await call('desktop_launch',{app:'files'});
   const shot=await call('desktop_screenshot');assert(shot.content.some(c=>c.type==='image'));
@@ -59,6 +79,8 @@ try{
   const configured=await fs.readFile(process.env.SHIKIGAMI_CODEX_CONFIG,'utf8');
   assert(configured.startsWith(unrelated.trimEnd()));
   assert(configured.includes('[mcp_servers.shikigami_desktop.tools.desktop_type]'));
+  const backups=(await fs.readdir(process.env.SHIKIGAMI_DESKTOP_DATA_DIR)).filter(n=>n.startsWith('codex-test.toml.shikigami-desktop-backup-'));
+  assert.equal(backups.length,1);assert.equal(await fs.readFile(path.join(process.env.SHIKIGAMI_DESKTOP_DATA_DIR,backups[0]),'utf8'),unrelated);
   assert.equal((await api('connect-codex',{approveDesktopOperations:true})).updated,false);
   await assert.rejects(()=>api('connect-codex',{}));result.isolatedConfigPreserved=true;
   await page.locator('[data-page="home"]').click();
@@ -76,9 +98,18 @@ try{
   await page.getByRole('button',{name:'作業メモ.txtをPCに保存',exact:true}).click();
   await page.getByText('PCに保存しました',{exact:false}).waitFor();
   assert((await fs.readFile(path.join(process.env.SHIKIGAMI_EXPORT_DIR,'作業メモ.txt'),'utf8')).includes('MCP経由の日本語入力。'));
+  if(process.platform==='win32'){assert.match(await fs.readFile(path.join(process.env.SHIKIGAMI_EXPORT_DIR,'作業メモ.txt:Zone.Identifier'),'utf8'),/ZoneId=3/);result.exportMarkOfTheWeb=true;}
   const second=await api('export',{name:'作業メモ.txt'});assert.equal(second.name,'作業メモ-2.txt');
   assert.equal(await fs.readFile(second.path,'utf8'),await fs.readFile(path.join(process.env.SHIKIGAMI_EXPORT_DIR,'作業メモ.txt'),'utf8'));result.windowsFileExport=true;result.exportDoesNotOverwrite=true;
   await page.screenshot({path:path.join(root,'artifacts','desktop-files.png'),fullPage:true});
+  // View-only panel: status, preview, and file names only. Admin pages and buttons stay hidden.
+  const viewPage=await browser.newPage({viewport:{width:1440,height:1000}});viewPage.on('pageerror',e=>errors.push(e.message));
+  await viewPage.goto(viewUrl);await viewPage.getByText('これは確認用の画面です',{exact:false}).waitFor();
+  for(const selector of ['[data-page="connect"]','[data-page="test"]','#start','#next-card'])assert(await viewPage.locator(selector).isHidden(),selector);
+  await viewPage.locator('#show').click();await viewPage.locator('#screen:visible').waitFor();assert(await viewPage.locator('#manual-card').isHidden());
+  await viewPage.locator('[data-page="files"]').click();await viewPage.getByText('作業メモ.txt',{exact:true}).first().waitFor();
+  assert.equal(await viewPage.getByRole('button',{name:/PCに保存/}).count(),0);
+  await viewPage.screenshot({path:path.join(root,'artifacts','desktop-view.png'),fullPage:true});await viewPage.close();
   await page.locator('[data-page="home"]').click();
   await page.setViewportSize({width:390,height:844});await page.screenshot({path:path.join(root,'artifacts','desktop-mobile.png'),fullPage:true});
   assert(!await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),'Mobile horizontal overflow');
@@ -95,7 +126,7 @@ try{
   assert(Buffer.from((await api('file',{name:'作業メモ.txt'})).data,'base64').toString('utf8').includes('MCP経由の日本語入力。'));result.filesSurviveStop=true;
   for(const client of clients)await client.close();
   await api('shutdown',{});await page.getByText('アプリに接続できません',{exact:true}).waitFor();
-  assert.deepEqual(errors,[]);result.ok=true;result.ui={previewOptIn:true,hiddenPreviewDoesNotPoll:true,manualControls:true,mobile:true,offline:true};
+  assert.deepEqual(errors,[]);result.ok=true;result.ui={previewOptIn:true,hiddenPreviewDoesNotPoll:true,manualControls:true,viewOnlyPanel:true,mobile:true,offline:true};
   await fs.writeFile(path.join(root,'artifacts','desktop-test.json'),JSON.stringify(result,null,2));
   console.log(JSON.stringify(result,null,2));
 }finally{for(const client of clients)await client.close().catch(()=>{});await browser?.close();await api('shutdown',{}).catch(()=>{});}

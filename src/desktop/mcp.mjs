@@ -21,7 +21,7 @@ async function api(route,body){
 }
 registration=await requestOnce('mcp/register',{});
 const server=new Server({name:'shikigami-desktop-lab',version:'0.1.0'},
-  {capabilities:{tools:{}},instructions:'Shikigami はWindowsとは独立した専用Linuxデスクトップです。最初に desktop_workspace を読んでください。必要なら desktop_start で起動し、画面取得で操作対象を確認してください。Chrome は desktop_launch({app:"chrome"}) と desktop_navigate で操作できます。保存ファイルは desktop_files と desktop_read_file で停止中も読み取れます。普段のWindowsアプリやホスト入力に切り替えないでください。確認画面は利用者が希望した場合だけ案内してください。安全な隔離環境であるとは主張しないでください。利用者の作業中に専用スペースを停止しないでください。接続断後、書き込み操作は自動再実行されません。'});
+  {capabilities:{tools:{}},instructions:'Shikigami はWindowsとは独立した専用Linuxデスクトップです。最初に desktop_workspace を読んでください。必要なら desktop_start で起動し、画面取得で操作対象を確認してください。Chrome は desktop_launch({app:"chrome"}) と desktop_navigate で操作できます。保存ファイルは desktop_files と desktop_read_file で停止中も読み取れます。普段のWindowsアプリやホスト入力に切り替えないでください。Linuxアプリのファイル選択画面などで /mnt 以下のWindowsのファイルを開いたり保存したりしないでください。desktop_workspace の panel は利用者向けの閲覧用画面です。利用者が希望した場合だけ案内してください。安全な隔離環境であるとは主張しないでください。利用者の作業中に専用スペースを停止しないでください。接続断後、書き込み操作は自動再実行されません。'});
 server.setRequestHandler(ListToolsRequestSchema,()=>api('tools'));
 server.setRequestHandler(CallToolRequestSchema,r=>api('mcp/call',{name:r.params.name,arguments:r.params.arguments||{}}));
 const heartbeat=setInterval(()=>requestOnce('mcp/heartbeat',{id:registration.id}).catch(()=>{}),30000);heartbeat.unref();

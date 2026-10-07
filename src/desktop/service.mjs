@@ -3,9 +3,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {spawn} from 'node:child_process';
-import {randomBytes,createHash} from 'node:crypto';
+import {randomBytes,createHash,timingSafeEqual} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {DesktopBridge} from './bridge.mjs';
+import {upsertCodexServer} from '../codex-config.mjs';
 
 const root=fileURLToPath(new URL('../../',import.meta.url));
 const data=path.resolve(process.env.SHIKIGAMI_DESKTOP_DATA_DIR||path.join(root,'.runtime','desktop-lab'));
@@ -27,7 +28,7 @@ function exportName(name,attempt){
   return stem+suffix+ext;
 }
 const tools=[
-  {name:'desktop_workspace',description:'Read the Shikigami Linux desktop status and optional preview URL. This is not the host Windows desktop.',inputSchema:object(),annotations:{readOnlyHint:true,openWorldHint:false}},
+  {name:'desktop_workspace',description:'Read the Shikigami Linux desktop status and an optional view-only preview URL for the user. This is not the host Windows desktop.',inputSchema:object(),annotations:{readOnlyHint:true,openWorldHint:false}},
   {name:'desktop_start',description:'Start the dedicated hidden Linux desktop. No host input or Windows applications.',inputSchema:object()},
   {name:'desktop_screenshot',description:'Capture only the dedicated Linux screen (1100×740).',inputSchema:object(),annotations:{readOnlyHint:true,openWorldHint:false}},
   {name:'desktop_windows',description:'List visible application windows inside the dedicated Linux desktop.',inputSchema:object(),annotations:{readOnlyHint:true,openWorldHint:false}},
@@ -47,26 +48,11 @@ function configToml(approve=false){
   if(approve)for(const tool of tools)value+=`\n[mcp_servers.shikigami_desktop.tools.${tool.name}]\napproval_mode = "approve"\n`;
   return value;
 }
-async function connectCodex(){
-  const config=path.resolve(process.env.SHIKIGAMI_CODEX_CONFIG||path.join(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'config.toml'));
-  await fs.mkdir(path.dirname(config),{recursive:true});
-  const read=()=>fs.readFile(config,'utf8').catch(e=>{if(e.code==='ENOENT')return '';throw e;});
-  const original=await read();let own=false;const keep=[];
-  for(const line of original.split(/\r?\n/)){
-    const heading=/^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
-    if(heading){const name=heading[1].replace(/["'\s]/g,'');own=name==='mcp_servers.shikigami_desktop'||name.startsWith('mcp_servers.shikigami_desktop.');}
-    if(!own)keep.push(line);
-  }
-  const updated=keep.join('\n').trimEnd()+'\n\n'+configToml(true);
-  if(original.replace(/\r\n/g,'\n')===updated)return {ok:true,updated:false,config,requiresReload:true};
-  if(await read()!==original)throw new Error('設定が別の処理で更新されました。再試行してください');
-  const backup=original?`${config}.shikigami-desktop-backup-${Date.now()}`:null;
-  if(backup)await fs.writeFile(backup,original,{flag:'wx'});
-  const temporary=`${config}.shikigami-desktop-${randomBytes(8).toString('hex')}.tmp`;
-  try{await fs.writeFile(temporary,updated,{flag:'wx'});if(await read()!==original)throw new Error('設定が同時に更新されました。再試行してください');await fs.rename(temporary,config);}
-  finally{await fs.unlink(temporary).catch(()=>{});}
-  return {ok:true,updated:true,config,backup,requiresReload:true};
-}
+// The shared writer keeps backups as config.toml.shikigami-desktop-backup-<time> and reports conflicts as 409.
+const connectCodex=()=>upsertCodexServer({server:'shikigami_desktop',section:configToml(true),backupTag:'shikigami-desktop'});
+const sameToken=(value,expected)=>{const a=Buffer.from(typeof value==='string'?value:''),b=Buffer.from(expected);return a.length===b.length&&timingSafeEqual(a,b);};
+// The view role is the read-only panel handed to AI agents: status, preview, file names, and Stop.
+const viewRoutes=new Set(['GET /api/status','GET /api/files','POST /api/capture','POST /api/stop']);
 
 async function alive(session){
   if(!session||!/^http:\/\/127\.0\.0\.1:\d+$/.test(session.base)||!/^[a-f0-9]{48}$/.test(session.token))return false;
@@ -95,7 +81,8 @@ export async function ensureDesktopService(){
 
 async function serve(){
   await fs.mkdir(data,{recursive:true});
-  const token=randomBytes(24).toString('hex'),instanceId=randomBytes(16).toString('hex');
+  const token=randomBytes(24).toString('hex'),viewToken=randomBytes(24).toString('hex'),instanceId=randomBytes(16).toString('hex');
+  const roleOf=value=>sameToken(value,token)?'admin':sameToken(value,viewToken)?'view':null;
   const restored=await fs.readFile(path.join(data,'latest-report.json'),'utf8').then(JSON.parse).catch(()=>null);
   let base,session,bridge=null,cached=null,busy=false,phase='起動するとChrome、エディター、電卓、ファイル管理を使えます',epoch=0,queue=Promise.resolve(),previewAt=null,lastReport=restored&&typeof restored==='object'?restored:null,humanReport=restored?.humanReport??null,demoRunning=false,closing=false,activity=Date.now(),events=[];
   if(lastReport)delete lastReport.humanReport;
@@ -172,6 +159,8 @@ async function serve(){
       catch(error){if(error.code==='EEXIST')continue;throw error;}
       try{await handle.writeFile(bytes);await handle.close();}
       catch(error){await handle.close().catch(()=>{});await fs.unlink(destination).catch(()=>{});throw error;}
+      // Mark-of-the-Web: Windows treats exports like downloads (SmartScreen, Office Protected View). Best effort on non-NTFS.
+      if(process.platform==='win32')await fs.writeFile(destination+':Zone.Identifier','[ZoneTransfer]\r\nZoneId=3\r\n').catch(()=>{});
       return {name:savedName,path:destination,size:bytes.length};
     }
     throw Object.assign(new Error('同名の成果物が100件あります。保存先を整理して再試行してください'),{status:409});
@@ -250,7 +239,7 @@ async function serve(){
     try{
       if(!tools.some(t=>t.name===name))throw new Error('Unknown desktop tool');
       let result;
-      if(name==='desktop_workspace')result={...await updateStatus(),panel:session.panel,platform:'Linux on WSL 2',windowsAppsSupported:false,inputIsolation:true,securitySandbox:false};
+      if(name==='desktop_workspace')result={...await updateStatus(),panel:session.view,panelAccess:'view-only',platform:'Linux on WSL 2',windowsAppsSupported:false,inputIsolation:true,securitySandbox:false};
       else if(name==='desktop_files')result=await listFiles();
       else if(name==='desktop_read_file'){
         result=await readFile(args.name);
@@ -273,17 +262,25 @@ async function serve(){
   async function body(req){let bytes=0,chunks=[];for await(const c of req){bytes+=c.length;if(bytes>100000)throw Object.assign(new Error('Request too large'),{status:413});chunks.push(c);}try{return bytes?JSON.parse(Buffer.concat(chunks).toString('utf8')):{};}catch{throw Object.assign(new Error('Invalid JSON'),{status:400});}}
   const server=http.createServer(async(req,res)=>{
     res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');
+    res.setHeader('X-Frame-Options','DENY');res.setHeader('Content-Security-Policy',"frame-ancestors 'none'");
     try{
       if(req.headers.host!==new URL(base).host||req.headers.origin&&req.headers.origin!==base)return reply(res,403,{error:'Invalid host or origin'});
       const url=new URL(req.url,base);
-      if(req.method==='GET'&&url.pathname===`/panel/${token}`){res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'}).end((await fs.readFile(path.join(root,'src','desktop','panel.html'),'utf8')).replaceAll('__TOKEN__',token));return;}
+      const page=req.method==='GET'&&/^\/(panel|view)\/([a-f0-9]{48})$/.exec(url.pathname);
+      if(page&&roleOf(page[2])===(page[1]==='panel'?'admin':'view')){
+        const html=(await fs.readFile(path.join(root,'src','desktop','panel.html'),'utf8')).replaceAll('__TOKEN__',page[2]).replaceAll('__ROLE__',page[1]==='panel'?'admin':'view');
+        res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'}).end(html);return;
+      }
       if(req.method==='GET'&&url.pathname==='/assets/shikigami-spirit.png'){res.writeHead(200,{'Content-Type':'image/png'}).end(await fs.readFile(path.join(root,'src','assets','shikigami-spirit.png')));return;}
-      if(req.headers['x-shikigami-token']!==token)return reply(res,403,{error:'Invalid token'});
-      activity=Date.now();const route=url.pathname;
+      const role=roleOf(req.headers['x-shikigami-token']);
+      if(!role)return reply(res,403,{error:'Invalid token'});
+      const route=url.pathname;
+      if(role!=='admin'&&!viewRoutes.has(`${req.method} ${route}`))return reply(res,403,{error:'確認用の画面では操作できません。Shikigamiの管理画面から行ってください'});
+      activity=Date.now();
       if(req.method==='GET'){
         if(route==='/api/health')return reply(res,200,{instanceId,pid:process.pid});
         if(route==='/api/status')return reply(res,200,await updateStatus());
-        if(route==='/api/files')return reply(res,200,await listFiles());
+        if(route==='/api/files'){const listed=await listFiles();return reply(res,200,role==='admin'?listed:{files:listed.files.map(({name,size,modifiedAt})=>({name,size,modifiedAt})),workspacePath:listed.workspacePath});}
         if(route==='/api/tools')return reply(res,200,{tools});
         if(route==='/api/config')return reply(res,200,{configToml:configToml()});
       }
@@ -327,7 +324,7 @@ async function serve(){
     }catch(e){return reply(res,e.status||500,{error:e.message});}
   });
   await new Promise(r=>server.listen(0,'127.0.0.1',r));base=`http://127.0.0.1:${server.address().port}`;
-  session={pid:process.pid,base,token,instanceId,panel:`${base}/panel/${token}`,started:new Date().toISOString(),dataDir:data};
+  session={pid:process.pid,base,token,instanceId,panel:`${base}/panel/${token}`,view:`${base}/view/${viewToken}`,started:new Date().toISOString(),dataDir:data};
   await fs.writeFile(sessionFile,JSON.stringify(session,null,2));
   async function shutdown(res){
     if(closing){if(res)reply(res,202,{ok:true,closing:true});return;}
