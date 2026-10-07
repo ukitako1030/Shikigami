@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Private X11 display. JSON lines on stdio; never connects to WSLg or host input."""
 import base64
+import argparse
 import ctypes
+import datetime
+import fcntl
 import io
 import json
+import mimetypes
 import os
 from pathlib import Path
 import re
 import secrets
 import signal
+import stat
 import struct
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 from PIL import Image
 
@@ -52,16 +58,84 @@ if len(sys.argv) == 3 and sys.argv[1] == '--cleanup':
     print(json.dumps(cleanup_session(sys.argv[2])))
     raise SystemExit(0)
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--workspace', default=secrets.token_hex(12))
+parser.add_argument('--read-files', action='store_true')
+parser.add_argument('--read-file')
+options = parser.parse_args()
+if not re.fullmatch(r'[a-f0-9]{24}', options.workspace):
+    raise ValueError('Invalid workspace identity')
+persistent = Path.home() / 'workspaces' / options.workspace
+files = persistent / 'files'
+files.mkdir(mode=0o700, parents=True, exist_ok=True)
+MAX_FILE = 20 * 1024 * 1024
+
+
+def valid_name(name):
+    return (isinstance(name, str) and 0 < len(name) <= 255 and name not in ('.', '..')
+            and not any(c in name for c in '/\\') and not any(ord(c) < 32 for c in name))
+
+
+def file_list():
+    entries = []
+    directory = os.open(files, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        with os.scandir(directory) as items:
+            for item in items:
+                if not valid_name(item.name) or not item.is_file(follow_symlinks=False):
+                    continue
+                try:
+                    info = item.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                entries.append({'name': item.name, 'size': info.st_size,
+                                'modifiedAt': datetime.datetime.fromtimestamp(
+                                    info.st_mtime, datetime.timezone.utc).isoformat()})
+                if len(entries) >= 1000:
+                    break
+    finally:
+        os.close(directory)
+    return {'files': entries, 'workspacePath': str(files)}
+
+
+def read_file(name):
+    if not valid_name(name):
+        raise ValueError('Invalid file name')
+    directory = os.open(files, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
+                raise ValueError('Only regular files up to 20 MiB can be read')
+            content = stream.read(MAX_FILE + 1)
+            if len(content) > MAX_FILE:
+                raise ValueError('File exceeds 20 MiB')
+    finally:
+        os.close(directory)
+    return {'name': name, 'size': len(content),
+            'mimeType': mimetypes.guess_type(name)[0] or 'application/octet-stream',
+            'data': base64.b64encode(content).decode('ascii')}
+
+
+if options.read_files or options.read_file is not None:
+    print(json.dumps(file_list() if options.read_files else read_file(options.read_file), ensure_ascii=False))
+    raise SystemExit(0)
+
+workspace_lock = (persistent / '.lock').open('a')
+try:
+    fcntl.flock(workspace_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise RuntimeError('This workspace is already running')
+(persistent / 'home').mkdir(mode=0o700, exist_ok=True)
 WIDTH, HEIGHT = 1100, 740
 BASE = Path.home() / 'sessions'
 BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
 work = BASE / secrets.token_hex(12)
 work.mkdir(mode=0o700)
-(work / 'home').mkdir()
-(work / 'files').mkdir()
 (work / 'runtime').mkdir(mode=0o700)
-note = work / 'files' / 'Shikigami-note.txt'
-note.write_text('', encoding='utf-8')
+note = files / '作業メモ.txt'
+test_note = files / 'Shikigami-note.txt'
 log = (work / 'process.log').open('ab', buffering=0)
 children = []
 display = None
@@ -69,7 +143,7 @@ env = dict(os.environ)
 for variable in ('DISPLAY', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS',
                  'PULSE_SERVER', 'WSL_INTEROP', 'XAUTHORITY', 'XDG_RUNTIME_DIR'):
     env.pop(variable, None)
-env.update(HOME=str(work / 'home'), XDG_RUNTIME_DIR=str(work / 'runtime'),
+env.update(HOME=str(persistent / 'home'), XDG_RUNTIME_DIR=str(work / 'runtime'),
            PATH='/usr/bin:/bin',
            SHIKIGAMI_LAB_SESSION=work.name,
            GDK_BACKEND='x11', QT_QPA_PLATFORM='xcb', LANG='C.UTF-8', LC_ALL='C.UTF-8',
@@ -181,7 +255,7 @@ def memory():
 def status():
     return {'running': running(), 'display': display, 'memory': memory(),
             'width': WIDTH, 'height': HEIGHT, 'sessionId': work.name,
-            'workspace': str(work / 'files'), 'notePath': str(note)}
+            'workspace': str(files), 'notePath': str(note)}
 
 
 def windows():
@@ -202,14 +276,20 @@ def windows():
     return result
 
 
-def launch(app):
+def launch(app, test=False):
     if app == 'editor':
-        matches = [w for w in windows() if 'Mousepad' in w['title']]
+        editor_note = test_note if test else note
+        try:
+            with editor_note.open('x', encoding='utf-8'):
+                pass
+        except FileExistsError:
+            pass
+        matches = [w for w in windows() if editor_note.name in w['title'] and 'Mousepad' in w['title']]
         if matches:
             xdo('windowactivate', '--sync', matches[0]['id'])
         else:
-            child(['dbus-run-session', '--', 'mousepad', '--disable-server', str(note)])
-        target = 'Mousepad'
+            child(['dbus-run-session', '--', 'mousepad', '--disable-server', str(editor_note)])
+        target = editor_note.name
     elif app == 'calculator':
         matches = [w for w in windows() if w['title'] == 'Calculator']
         if matches:
@@ -217,10 +297,35 @@ def launch(app):
         else:
             child(['xcalc', '-title', 'Calculator', '-geometry', '300x420+755+140'])
         target = 'Calculator'
+    elif app == 'chrome':
+        target = 'Google Chrome'
+        matches = [w for w in windows() if target in w['title']]
+        if not matches:
+            profile = persistent / 'home' / 'chrome'
+            preferences = profile / 'Default' / 'Preferences'
+            if not preferences.exists():
+                preferences.parent.mkdir(parents=True, exist_ok=True)
+                preferences.write_text(json.dumps({'download': {'default_directory': str(files),
+                    'prompt_for_download': False}, 'browser': {'check_default_browser': False}}))
+            child(['google-chrome-stable', '--user-data-dir=' + str(profile),
+                   '--no-first-run', '--no-default-browser-check', '--disable-dev-shm-usage',
+                   '--ozone-platform=x11',
+                   '--window-size=1060,680', '--window-position=20,25', 'about:blank'])
+    elif app == 'files':
+        target = 'files'
+        matches = [w for w in windows() if w['title'] == target]
+        if not matches:
+            child(['dbus-run-session', '--', 'pcmanfm', '--new-win', str(files)])
     else:
         raise ValueError('Unknown app')
-    for _ in range(50):
-        matches = [w for w in windows() if target in w['title']]
+    def matches_target(title):
+        if app == 'editor':
+            return title.endswith(editor_note.name + ' - Mousepad')
+        if app in ('files', 'calculator'):
+            return title == target
+        return title.endswith(' - Google Chrome') or title == 'Google Chrome'
+    for _ in range(120):
+        matches = [w for w in windows() if matches_target(w['title'])]
         if matches:
             wid = matches[0]['id']
             if app == 'editor':
@@ -262,7 +367,19 @@ def dispatch(command):
     if method == 'windows':
         return {'windows': windows()}
     if method == 'launch':
-        return launch(command.get('app'))
+        return launch(command.get('app'), command.get('test') is True)
+    if method == 'navigate':
+        url = command.get('url')
+        if not isinstance(url, str) or len(url) > 2048 or any(ord(c) < 32 for c in url):
+            raise ValueError('Invalid URL')
+        parsed = urlsplit(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            raise ValueError('Only http:// and https:// URLs are supported')
+        launch('chrome')
+        xdo('key', '--clearmodifiers', 'ctrl+l')
+        dispatch({'method': 'type', 'text': url})
+        xdo('key', '--clearmodifiers', 'Return')
+        return {'ok': True, 'url': url}
     if method == 'click':
         x, y, button = command.get('x'), command.get('y'), command.get('button', 1)
         if not isinstance(x, int) or not isinstance(y, int) or not (0 <= x < WIDTH and 0 <= y < HEIGHT) or button not in (1, 3):
@@ -290,13 +407,13 @@ def dispatch(command):
         time.sleep(.15)
     elif method == 'key':
         key = command.get('key')
-        if key not in ('ctrl+a', 'ctrl+s', 'ctrl+o', 'ctrl+n', 'ctrl+z', 'ctrl+y', 'ctrl+f',
+        if key not in ('ctrl+a', 'ctrl+s', 'ctrl+o', 'ctrl+n', 'ctrl+z', 'ctrl+y', 'ctrl+f', 'ctrl+l',
                        'Return', 'Escape', 'Tab', 'BackSpace', 'Delete', 'Home', 'End',
                        'Up', 'Down', 'Left', 'Right', 'Page_Up', 'Page_Down', 'alt+F4'):
             raise ValueError('Unsupported key')
         xdo('key', '--clearmodifiers', key)
     elif method == 'read_test_note':
-        return {'text': note.read_text(encoding='utf-8'), 'path': str(note)}
+        return {'text': test_note.read_text(encoding='utf-8'), 'path': str(test_note)}
     else:
         raise ValueError('Unsupported desktop operation')
     return {'ok': True}

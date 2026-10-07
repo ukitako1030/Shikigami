@@ -3,24 +3,41 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {spawn} from 'node:child_process';
-import {randomBytes} from 'node:crypto';
+import {randomBytes,createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {DesktopBridge} from './bridge.mjs';
 
 const root=fileURLToPath(new URL('../../',import.meta.url));
 const data=path.resolve(process.env.SHIKIGAMI_DESKTOP_DATA_DIR||path.join(root,'.runtime','desktop-lab'));
+const exportDir=path.resolve(process.env.SHIKIGAMI_EXPORT_DIR||path.join(os.homedir(),'Documents','Shikigami','成果物'));
+const workspaceKey=createHash('sha256').update(data).digest('hex').slice(0,24);
 const sessionFile=path.join(data,'session.json');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const object=(properties={},required=[])=>({type:'object',properties,required,additionalProperties:false});
+function clipUnits(value,limit){let out='';for(const char of value){if(out.length+char.length>limit)break;out+=char;}return out;}
+function exportName(name,attempt){
+  let clean=name.normalize('NFC').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').replace(/[. ]+$/g,'');
+  if(!clean)clean='file';
+  let ext=path.win32.extname(clean);
+  if(ext.length>40)ext='';
+  let stem=ext?clean.slice(0,-ext.length):clean;
+  if(/^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])$/i.test(stem))stem='_'+stem;
+  const suffix=attempt===1?'':`-${attempt}`;
+  stem=clipUnits(stem,180-ext.length-suffix.length).replace(/[. ]+$/g,'')||'file';
+  return stem+suffix+ext;
+}
 const tools=[
-  {name:'desktop_workspace',description:'Read the Shikigami Linux desktop status and optional preview URL. This is not the host Windows desktop.',inputSchema:object()},
+  {name:'desktop_workspace',description:'Read the Shikigami Linux desktop status and optional preview URL. This is not the host Windows desktop.',inputSchema:object(),annotations:{readOnlyHint:true,openWorldHint:false}},
   {name:'desktop_start',description:'Start the dedicated hidden Linux desktop. No host input or Windows applications.',inputSchema:object()},
-  {name:'desktop_screenshot',description:'Capture only the dedicated Linux screen (1100×740).',inputSchema:object()},
-  {name:'desktop_windows',description:'List visible application windows inside the dedicated Linux desktop.',inputSchema:object()},
-  {name:'desktop_launch',description:'Open the native editor or calculator in the dedicated desktop.',inputSchema:object({app:{type:'string',enum:['editor','calculator']}},['app'])},
+  {name:'desktop_screenshot',description:'Capture only the dedicated Linux screen (1100×740).',inputSchema:object(),annotations:{readOnlyHint:true,openWorldHint:false}},
+  {name:'desktop_windows',description:'List visible application windows inside the dedicated Linux desktop.',inputSchema:object(),annotations:{readOnlyHint:true,openWorldHint:false}},
+  {name:'desktop_files',description:'List files saved in this dedicated Linux workspace, including while the desktop is stopped.',inputSchema:object(),annotations:{readOnlyHint:true,openWorldHint:false}},
+  {name:'desktop_read_file',description:'Read one named file from this dedicated Linux workspace (up to 20 MiB).',inputSchema:object({name:{type:'string',minLength:1,maxLength:255}},['name']),annotations:{readOnlyHint:true,openWorldHint:false}},
+  {name:'desktop_launch',description:'Open Chrome, the native editor, calculator, or file manager in the dedicated desktop.',inputSchema:object({app:{type:'string',enum:['chrome','editor','calculator','files']}},['app'])},
+  {name:'desktop_navigate',description:'Navigate the dedicated Chrome to an http:// or https:// URL.',inputSchema:object({url:{type:'string',pattern:'^https?://',maxLength:2048}},['url'])},
   {name:'desktop_click',description:'Click coordinates in the dedicated Linux screen. Never moves the host pointer.',inputSchema:object({x:{type:'integer',minimum:0,maximum:1099},y:{type:'integer',minimum:0,maximum:739},button:{type:'integer',enum:[1,3]}},['x','y'])},
   {name:'desktop_type',description:'Paste text into the focused Linux application using the private display clipboard.',inputSchema:object({text:{type:'string',maxLength:10000}},['text'])},
-  {name:'desktop_key',description:'Send a key combination inside the dedicated desktop only.',inputSchema:object({key:{type:'string',enum:['ctrl+a','ctrl+s','ctrl+o','ctrl+n','ctrl+z','ctrl+y','ctrl+f','Return','Escape','Tab','BackSpace','Delete','Home','End','Up','Down','Left','Right','Page_Up','Page_Down','alt+F4']}},['key'])},
+  {name:'desktop_key',description:'Send a key combination inside the dedicated desktop only.',inputSchema:object({key:{type:'string',enum:['ctrl+a','ctrl+s','ctrl+o','ctrl+n','ctrl+z','ctrl+y','ctrl+f','ctrl+l','Return','Escape','Tab','BackSpace','Delete','Home','End','Up','Down','Left','Right','Page_Up','Page_Down','alt+F4']}},['key'])},
   {name:'desktop_scroll',description:'Scroll at the private Linux pointer position.',inputSchema:object({direction:{type:'string',enum:['up','down']},steps:{type:'integer',minimum:1,maximum:20}},['direction'])},
   {name:'desktop_stop',description:'Stop only the dedicated desktop processes. Unsaved app changes are lost; saved notes remain.',inputSchema:object()}
 ];
@@ -79,18 +96,27 @@ export async function ensureDesktopService(){
 async function serve(){
   await fs.mkdir(data,{recursive:true});
   const token=randomBytes(24).toString('hex'),instanceId=randomBytes(16).toString('hex');
-  let base,session,bridge=null,cached=null,busy=false,phase='起動するとエディターと電卓を使えます',epoch=0,queue=Promise.resolve(),previewAt=null,lastReport=null,humanReport=null,demoRunning=false,closing=false,activity=Date.now(),events=[];
+  const restored=await fs.readFile(path.join(data,'latest-report.json'),'utf8').then(JSON.parse).catch(()=>null);
+  let base,session,bridge=null,cached=null,busy=false,phase='起動するとChrome、エディター、電卓、ファイル管理を使えます',epoch=0,queue=Promise.resolve(),previewAt=null,lastReport=restored&&typeof restored==='object'?restored:null,humanReport=restored?.humanReport??null,demoRunning=false,closing=false,activity=Date.now(),events=[];
+  if(lastReport)delete lastReport.humanReport;
+  const filesBridge=new DesktopBridge({workspaceKey});
   const agents=new Map();
-  const status=()=>({running:Boolean(cached?.running&&bridge?.child),needsCleanup:Boolean(bridge?.sessionId&&!bridge.child),busy,phase,connections:agents.size,memory:cached?.running?cached.memory:null,lastReport,humanReport,previewAt});
+  const status=()=>({running:Boolean(cached?.running&&bridge?.child),needsCleanup:Boolean(!busy&&bridge&&(bridge.sessionId||bridge.child)&&!cached?.running),busy,phase,connections:agents.size,memory:cached?.running?cached.memory:null,lastReport,humanReport,previewAt,workspaceKey});
   const serialized=fn=>{const next=queue.then(fn,fn);queue=next.catch(()=>{});return next;};
   async function start(){
     if(demoRunning)throw Object.assign(new Error('デモの終了後に起動してください'),{status:409});
+    if(status().needsCleanup)throw Object.assign(new Error('先に専用プロセスの停止を再試行してください'),{status:409});
     const generation=epoch;
     return serialized(async()=>{
       if(generation!==epoch)throw new Error('起動を取り消しました');
       busy=true;phase='専用Linuxデスクトップを起動しています';
-      try{bridge ||= new DesktopBridge();cached=await bridge.start();phase='専用デスクトップの準備ができました';return status();}
-      catch(e){bridge=null;cached=null;phase='起動できませんでした。セットアップ状況を確認してください';throw e;}
+      try{bridge ||= new DesktopBridge({workspaceKey});cached=await bridge.start();phase='専用デスクトップの準備ができました';return status();}
+      catch(e){
+        // start() may have failed while its cleanup also failed. Keep the session ID
+        // so a later Stop can retry cleanup of this dedicated process group.
+        if(!bridge?.sessionId&&!bridge?.child)bridge=null;
+        cached=null;phase=bridge?'起動に失敗しました。専用プロセスの停止を再試行してください':'起動できませんでした。セットアップ状況を確認してください';throw e;
+      }
       finally{busy=false;}
     });
   }
@@ -98,14 +124,15 @@ async function serve(){
     epoch++;phase='専用プロセスを停止しています';busy=true;
     return serialized(async()=>{
       try{await bridge?.stop();bridge=null;cached=null;previewAt=null;phase='停止しました。保存済みのメモはLinux側に残ります';}
-      catch(e){phase='停止を確認できませんでした。もう一度停止してください';throw e;}
+      catch(e){cached=null;phase='停止を確認できませんでした。もう一度停止してください';throw e;}
       finally{busy=false;}
       return status();
     });
   }
   async function operation(body,{internal=false}={}){
-    const methods=['launch','capture','windows','click','type','key','scroll'];
+    const methods=['launch','navigate','capture','windows','click','type','key','scroll'];
     if(!methods.includes(body.method))throw new Error('未対応の操作です');
+    if(!internal&&body.test!==undefined)throw new Error('テスト用ファイルは自動デモからのみ開けます');
     if(demoRunning&&!internal)throw Object.assign(new Error('デモの終了後に操作してください'),{status:409});
     const generation=epoch;
     return serialized(async()=>{
@@ -122,20 +149,63 @@ async function serve(){
     if(bridge?.child)try{cached=await bridge.request({method:'status'});}catch{cached=null;}
     return status();
   }
-  async function saveReport(){if(lastReport)await fs.writeFile(path.join(data,'latest-report.json'),JSON.stringify({...lastReport,humanReport},null,2));}
+  async function listFiles(){
+    const result=await filesBridge.readFiles();
+    if(!Array.isArray(result?.files)||typeof result.workspacePath!=='string')throw new Error('ファイル一覧の応答が不正です');
+    return result;
+  }
+  async function readFile(name){
+    const result=await filesBridge.readFile(name);
+    if(result?.name!==name||typeof result.mimeType!=='string'||typeof result.data!=='string'||!Number.isInteger(result.size)||result.size<0||result.size>20*1024*1024)throw new Error('ファイル応答が不正です');
+    if(Buffer.from(result.data,'base64').length!==result.size)throw new Error('ファイル内容の長さが一致しません');
+    return result;
+  }
+  async function exportFile(name){
+    const result=await readFile(name);
+    const bytes=Buffer.from(result.data,'base64');
+    await fs.mkdir(exportDir,{recursive:true});
+    for(let attempt=1;attempt<=100;attempt++){
+      const savedName=exportName(result.name,attempt);
+      const destination=path.join(exportDir,savedName);
+      let handle;
+      try{handle=await fs.open(destination,'wx');}
+      catch(error){if(error.code==='EEXIST')continue;throw error;}
+      try{await handle.writeFile(bytes);await handle.close();}
+      catch(error){await handle.close().catch(()=>{});await fs.unlink(destination).catch(()=>{});throw error;}
+      return {name:savedName,path:destination,size:bytes.length};
+    }
+    throw Object.assign(new Error('同名の成果物が100件あります。保存先を整理して再試行してください'),{status:409});
+  }
+  function assessHumanConcurrency(){
+    if(!lastReport)return;
+    const input=(lastReport.humanEvents?.input||0)>0;
+    const pointer=(lastReport.humanEvents?.pointermove||0)+(lastReport.humanEvents?.pointerdown||0)>0;
+    lastReport.humanConcurrentInputObserved=Boolean(lastReport.humanEventWindow==='ai-operations'&&input&&pointer&&lastReport.actions>0);
+    lastReport.humanConcurrencyVerified=Boolean(lastReport.mode==='human'&&lastReport.humanEventWindow==='ai-operations'&&lastReport.success&&lastReport.humanConcurrentInputObserved&&humanReport==='none');
+    lastReport.humanConcurrencyScope=lastReport.humanEventWindow==='ai-operations'
+      ?'専用パネル上のAI操作実行中の入力・ポインター操作と、利用者の干渉なしという自己申告に限ります。他のWindowsアプリや一般的な非干渉を保証しません。'
+      :'以前の報告に操作時刻の照合情報がないため、同時操作の判定はできません。記録済みの操作数と自己申告は保持しています。';
+  }
+  if(lastReport)assessHumanConcurrency();
+  async function saveReport(){if(lastReport){assessHumanConcurrency();await fs.writeFile(path.join(data,'latest-report.json'),JSON.stringify({...lastReport,humanReport},null,2));}}
   async function demo(seconds){
     const generation=epoch,began=Date.now(),runId=randomBytes(8).toString('hex');
     events=[];humanReport=null;lastReport=null;demoRunning=true;busy=true;
-    const report={success:false,cancelled:false,runId,durationSeconds:0,actions:0,cycles:0,savedVerified:false,peakPssMiB:0,peakRssMiB:0,humanEvents:{input:0,pointermove:0,pointerdown:0,wheel:0},humanConcurrencyVerified:false};
+    const aiWindows=[];
+    const report={success:false,cancelled:false,mode:seconds===60?'human':'automatic',humanEventWindow:'ai-operations',runId,durationSeconds:0,actions:0,cycles:0,savedVerified:false,peakPssMiB:0,peakRssMiB:0,humanEvents:{input:0,pointermove:0,pointerdown:0,wheel:0},humanConcurrencyVerified:false};
     let observer=null;
     const stopFile=path.join(data,`${runId}-observe.stop`),observeFile=path.join(data,`${runId}-observe.json`);
     if(process.platform==='win32')observer=spawn('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',path.join(root,'scripts','observe.ps1'),'-RootPid',String(process.pid),'-OutputPath',observeFile,'-StopPath',stopFile],{windowsHide:true,stdio:'ignore'});
     const guard=()=>{if(epoch!==generation||!bridge)throw Object.assign(new Error('利用者が停止しました'),{cancelled:true});};
-    const perform=async body=>{guard();const r=await operation(body,{internal:true});report.actions++;return r;};
+    const perform=async body=>{
+      guard();const started=Date.now();
+      try{const result=await operation(body,{internal:true});report.actions++;return result;}
+      finally{aiWindows.push([started,Date.now()]);}
+    };
     try{
       do{
         phase=`自動デモ ${report.cycles+1} 回目：エディターで入力・保存`;
-        await perform({method:'launch',app:'editor'});
+        await perform({method:'launch',app:'editor',test:true});
         await perform({method:'click',x:220,y:180,button:1});
         await perform({method:'key',key:'ctrl+a'});
         const text=`Shikigami — AI専用デスクトップ\n\nこれはブラウザの中の編集画面ではありません。\nLinuxのエディターを、専用画面で操作しています。\n\n日本語の入力と保存：${report.cycles+1} 回目\nあなたは普段のWindowsで作業を続けられます。\n\n${Array.from({length:28},(_,i)=>`記録 ${i+1}：非表示の専用スペースで作業中。`).join('\n')}\n`;
@@ -160,7 +230,9 @@ async function serve(){
     }catch(e){report.cancelled=Boolean(e.cancelled||epoch!==generation);report.error=e.message;if(!report.cancelled)phase='デモでエラーが発生しました：'+e.message;}
     finally{
       report.durationSeconds=Math.round((Date.now()-began)/100)/10;
-      for(const event of events)if(event.type in report.humanEvents)report.humanEvents[event.type]++;
+      for(const event of events){
+        if(event.type in report.humanEvents&&aiWindows.some(([start,end])=>event.t>=start&&event.t<=end))report.humanEvents[event.type]++;
+      }
       if(observer){
         await fs.writeFile(stopFile,'stop');
         if(observer.exitCode===null)await Promise.race([new Promise(r=>observer.once('exit',r)),sleep(8000)]);
@@ -179,6 +251,14 @@ async function serve(){
       if(!tools.some(t=>t.name===name))throw new Error('Unknown desktop tool');
       let result;
       if(name==='desktop_workspace')result={...await updateStatus(),panel:session.panel,platform:'Linux on WSL 2',windowsAppsSupported:false,inputIsolation:true,securitySandbox:false};
+      else if(name==='desktop_files')result=await listFiles();
+      else if(name==='desktop_read_file'){
+        result=await readFile(args.name);
+        const metadata={name:result.name,mimeType:result.mimeType,size:result.size};
+        if(/^text\//.test(result.mimeType)||/^(application\/(?:json|xml|javascript))$/.test(result.mimeType))return {content:[{type:'text',text:JSON.stringify(metadata)},{type:'text',text:Buffer.from(result.data,'base64').toString('utf8')}]};
+        if(/^image\/(?:png|jpeg|gif|webp)$/.test(result.mimeType))return {content:[{type:'text',text:JSON.stringify(metadata)},{type:'image',data:result.data,mimeType:result.mimeType}]};
+        return {content:[{type:'text',text:JSON.stringify(metadata)},{type:'resource',resource:{uri:`shikigami-desktop://file/${encodeURIComponent(result.name)}`,mimeType:result.mimeType,blob:result.data}}]};
+      }
       else if(name==='desktop_start')result=await start();
       else if(name==='desktop_stop')result=await stop();
       else{
@@ -203,6 +283,7 @@ async function serve(){
       if(req.method==='GET'){
         if(route==='/api/health')return reply(res,200,{instanceId,pid:process.pid});
         if(route==='/api/status')return reply(res,200,await updateStatus());
+        if(route==='/api/files')return reply(res,200,await listFiles());
         if(route==='/api/tools')return reply(res,200,{tools});
         if(route==='/api/config')return reply(res,200,{configToml:configToml()});
       }
@@ -214,6 +295,8 @@ async function serve(){
         }
         if(route==='/api/start')return reply(res,200,await start());
         if(route==='/api/stop')return reply(res,200,await stop());
+        if(route==='/api/file')return reply(res,200,await readFile(value.name));
+        if(route==='/api/export')return reply(res,200,await exportFile(value.name));
         if(route==='/api/capture'){
           // Read-only preview may share the serialized pipe with a demo.
           if(!bridge||!cached?.running)return reply(res,409,{error:'専用スペースは停止中です'});
@@ -238,7 +321,7 @@ async function serve(){
         if(route==='/api/mcp/heartbeat'){if(agents.has(value.id))agents.set(value.id,Date.now());return reply(res,200,{});}
         if(route==='/api/mcp/unregister'){agents.delete(value.id);return reply(res,200,{});}
         if(route==='/api/mcp/call')return reply(res,200,await callTool(value.name,value.arguments||{}));
-        if(route==='/api/shutdown'){reply(res,200,{ok:true});setImmediate(shutdown);return;}
+        if(route==='/api/shutdown'){await shutdown(res);return;}
       }
       return reply(res,404,{error:'Not found'});
     }catch(e){return reply(res,e.status||500,{error:e.message});}
@@ -246,11 +329,25 @@ async function serve(){
   await new Promise(r=>server.listen(0,'127.0.0.1',r));base=`http://127.0.0.1:${server.address().port}`;
   session={pid:process.pid,base,token,instanceId,panel:`${base}/panel/${token}`,started:new Date().toISOString(),dataDir:data};
   await fs.writeFile(sessionFile,JSON.stringify(session,null,2));
-  async function shutdown(){if(closing)return;closing=true;await stop().catch(()=>{});server.close();await fs.unlink(sessionFile).catch(()=>{});process.exit(0);}
-  process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
+  async function shutdown(res){
+    if(closing){if(res)reply(res,202,{ok:true,closing:true});return;}
+    closing=true;
+    try{await stop();}
+    catch(error){
+      closing=false;activity=Date.now();
+      if(res)reply(res,409,{error:'専用プロセスの停止を確認できませんでした。停止を再試行してください: '+error.message});
+      else console.error('Shikigami cleanup failed:',error);
+      return;
+    }
+    if(res)reply(res,200,{ok:true});
+    await new Promise(resolve=>server.close(resolve));
+    await fs.unlink(sessionFile).catch(()=>{});
+    process.exit(0);
+  }
+  process.on('SIGTERM',()=>{shutdown().catch(console.error);});process.on('SIGINT',()=>{shutdown().catch(console.error);});
   setInterval(()=>{
     for(const [id,t]of agents)if(Date.now()-t>90000)agents.delete(id);
-    if(!busy&&agents.size===0&&Date.now()-activity>15*60_000)shutdown();
+    if(!busy&&agents.size===0&&Date.now()-activity>15*60_000)shutdown().catch(console.error);
   },30000).unref();
 }
 if(process.argv.includes('--serve'))serve().catch(e=>{console.error(e);process.exitCode=1;});

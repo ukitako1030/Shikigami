@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import {randomBytes} from 'node:crypto';
 import {DesktopBridge} from '../src/desktop/bridge.mjs';
-const bridge=new DesktopBridge();
+const bridge=new DesktopBridge({workspaceKey:randomBytes(12).toString('hex')});
 try{
   console.log('start',await bridge.start());
-  console.log('editor',await bridge.request({method:'launch',app:'editor'}));
+  console.log('editor',await bridge.request({method:'launch',app:'editor',test:true}));
   await bridge.request({method:'click',x:250,y:180,button:1});
   await bridge.request({method:'type',text:'Shikigami desktop\n日本語の入力と保存を確認します。\n'});
   await bridge.request({method:'key',key:'ctrl+s'});
@@ -13,6 +14,13 @@ try{
   assert(saved.text.includes('日本語の入力と保存を確認します。'),JSON.stringify(saved));
   console.log('saved',saved);
   console.log('calculator',await bridge.request({method:'launch',app:'calculator'}));
+  console.log('chrome',await bridge.request({method:'navigate',url:'https://example.com/'}));
+  await new Promise(r=>setTimeout(r,2500));
+  console.log('chrome windows',await bridge.request({method:'windows'}));
+  console.log('files',await bridge.request({method:'launch',app:'files'}));
+  assert((await bridge.readFiles()).files.some(f=>f.name==='Shikigami-note.txt'));
+  assert(Buffer.from((await bridge.readFile('Shikigami-note.txt')).data,'base64').toString('utf8').includes('日本語'));
+  await assert.rejects(()=>bridge.readFile('../.lock'));
   const shot=await bridge.request({method:'capture'});
   await fs.mkdir('artifacts',{recursive:true});
   await fs.writeFile('artifacts/desktop-first.png',Buffer.from(shot.image,'base64'));
@@ -23,5 +31,6 @@ try{
   await new Promise(r=>setTimeout(r,500));
   await bridge.stop();
   assert.equal(bridge.sessionId,null);
+  assert(Buffer.from((await bridge.readFile('Shikigami-note.txt')).data,'base64').toString('utf8').includes('日本語'));
   console.log('verified session-scoped cleanup after launcher termination');
 }finally{await bridge.stop();}

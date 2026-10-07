@@ -13,7 +13,17 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends --no-upgrade \
-  xvfb openbox mousepad x11-apps xdotool xclip xauth python3-pil fonts-noto-cjk
+  xvfb openbox mousepad x11-apps xdotool xclip xauth python3-pil fonts-noto-cjk pcmanfm curl ca-certificates
+if ! command -v google-chrome-stable >/dev/null 2>&1; then
+  # Official Google package over TLS. Never use an unsigned third-party mirror.
+  package=$(mktemp /tmp/shikigami-chrome-XXXXXX.deb)
+  trap 'rm -f "$package"' EXIT HUP INT TERM
+  curl --fail --location --proto '=https' --tlsv1.2 \
+    https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o "$package"
+  test "$(dpkg-deb -f "$package" Package)" = google-chrome-stable
+  test "$(dpkg-deb -f "$package" Architecture)" = amd64
+  apt-get install -y --no-install-recommends "$package"
+fi
 if ! id shikigami-lab >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /var/lib/shikigami-lab \
     --shell /usr/sbin/nologin shikigami-lab

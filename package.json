@@ -19,6 +19,9 @@
     "test:shared": "node scripts/verify-shared.mjs",
     "test:ui": "node scripts/verify-ui.mjs",
     "test:desktop": "node scripts/verify-desktop.mjs",
+    "test:desktop:codex": "node scripts/verify-desktop-codex.mjs",
+    "test:desktop:files": "node scripts/verify-desktop-files.mjs",
+    "test:desktop:recovery": "node scripts/verify-desktop-recovery.mjs",
     "inspect:panel": "node scripts/inspect-panel.mjs"
   },
   "engines": {

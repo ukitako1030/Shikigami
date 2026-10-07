@@ -1,6 +1,8 @@
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {fileURLToPath} from 'node:url';
+import {createHash} from 'node:crypto';
+import path from 'node:path';
 
 const workerFile=fileURLToPath(new URL('./worker.py',import.meta.url));
 function linuxPath(value){
@@ -9,14 +11,37 @@ function linuxPath(value){
 }
 
 export class DesktopBridge {
-  constructor(){this.child=null;this.pending=new Map();this.sequence=0;this.error='';this.sessionId=null;}
+  constructor({workspaceKey}={}){
+    const defaultData=path.resolve(process.env.SHIKIGAMI_DESKTOP_DATA_DIR||fileURLToPath(new URL('../../.runtime/desktop-lab',import.meta.url)));
+    this.workspaceKey=workspaceKey||createHash('sha256').update(defaultData).digest('hex').slice(0,24);
+    if(!/^[a-f0-9]{24}$/.test(this.workspaceKey))throw new Error('Invalid workspace key');
+    this.child=null;this.pending=new Map();this.sequence=0;this.error='';this.sessionId=null;
+  }
+  workerArgs(extra=[],unbuffered=false){
+    const python=[...(unbuffered?['-u']:[]),process.platform==='win32'?linuxPath(workerFile):workerFile,'--workspace',this.workspaceKey,...extra];
+    return process.platform==='win32'
+      ?['-d',process.env.SHIKIGAMI_WSL_DISTRO||'Ubuntu-22.04','-u','shikigami-lab','--exec','python3',...python]
+      :python;
+  }
+  staticRPC(extra,timeoutMs=30000){
+    return new Promise((resolve,reject)=>{
+      const child=spawn(process.platform==='win32'?'wsl.exe':'python3',this.workerArgs(extra),{windowsHide:true,stdio:['ignore','pipe','pipe']});
+      let chunks=[],bytes=0,error='',settled=false;
+      const finish=(failure,value)=>{if(settled)return;settled=true;clearTimeout(timer);failure?reject(failure):resolve(value);};
+      child.stdout.on('data',chunk=>{bytes+=chunk.length;if(bytes>30_000_000){child.kill();finish(new Error('ファイルが読み取り上限を超えました'));}else chunks.push(chunk);});
+      child.stderr.on('data',chunk=>{error=(error+chunk.toString()).slice(-2000);});
+      const timer=setTimeout(()=>{child.kill();finish(new Error('ファイル一覧の取得がタイムアウトしました'));},timeoutMs);
+      child.on('error',e=>finish(e));
+      child.on('exit',code=>{if(code!==0)return finish(new Error(error||'ファイルを読み取れませんでした'));try{finish(null,JSON.parse(Buffer.concat(chunks).toString('utf8')));}catch(e){finish(new Error('ファイル応答を読み取れませんでした: '+e.message));}});
+    });
+  }
+  readFiles(){return this.staticRPC(['--read-files']);}
+  readFile(name){if(typeof name!=='string'||!name||name.length>255)throw new Error('ファイル名を確認してください');return this.staticRPC(['--read-file',name]);}
   async start(){
     if(this.child)return this.request({method:'start'});
     if(this.sessionId)await this.stop();
     const command=process.platform==='win32'?'wsl.exe':'python3';
-    const args=process.platform==='win32'
-      ?['-d',process.env.SHIKIGAMI_WSL_DISTRO||'Ubuntu-22.04','-u','shikigami-lab','--exec','python3','-u',linuxPath(workerFile)]
-      :['-u',workerFile];
+    const args=this.workerArgs([],true);
     const child=spawn(command,args,{windowsHide:true,stdio:['pipe','pipe','pipe']});
     this.child=child;this.error='';
     child.stderr.on('data',chunk=>{this.error=(this.error+chunk.toString()).slice(-2000);});
