@@ -17,7 +17,10 @@ await fs.mkdir(artifacts, {recursive:true});
 await fs.mkdir(runtime, {recursive:true});
 const token = randomBytes(24).toString('hex');
 const client = new Client({name:'shikigami-probe',version:'0.1.0'});
-const transport = new StdioClientTransport({command:process.execPath,args:[path.join(root,'node_modules/@playwright/mcp/cli.js'),'--headless','--browser','chrome','--isolated','--caps','vision','--viewport-size','1100x740','--timeout-settle','50','--idle-timeout','120000','--output-dir',artifacts],cwd:root,stderr:'pipe'});
+// Playwright MCP resolves AI-supplied file names against its cwd, so keep it away from the source tree.
+const browserWorkspace = path.join(runtime,'probe-workspace');
+await fs.mkdir(browserWorkspace,{recursive:true});
+const transport = new StdioClientTransport({command:process.execPath,args:[path.join(root,'node_modules/@playwright/mcp/cli.js'),'--headless','--browser','chrome','--isolated','--caps','vision','--viewport-size','1100x740','--timeout-settle','50','--idle-timeout','120000','--output-dir',artifacts],cwd:browserWorkspace,stderr:'pipe'});
 await client.connect(transport);
 const tools = (await client.listTools()).tools;
 const runTool = tools.find(t=>/^browser_run_code(?:_unsafe)?$/.test(t.name))?.name;
@@ -30,7 +33,7 @@ const allowedToolNames = new Set([
   'browser_take_screenshot','browser_snapshot','browser_click','browser_drag','browser_hover',
   'browser_select_option','browser_tabs','browser_wait_for'
 ]);
-const exposedTools = tools.filter(t=>allowedToolNames.has(t.name));
+const exposedTools = tools.filter(t=>allowedToolNames.has(t.name)).map(t=>{const {filename,...properties}=t.inputSchema.properties??{};return {...t,inputSchema:{...t.inputSchema,properties}};});
 let latestImage = null, lastReport = null, busy = false, progress = 'テスト待機中', runId = null;
 let human = [], operations = [], lastActivity = Date.now(), closed = false;
 let chain = Promise.resolve();
@@ -83,7 +86,7 @@ async function run(seconds=30, mode='automatic') {
   let observer, observerDone, started=Date.now(), cycles=0, assertions=0, error=null;
   try {
     await call('browser_close'); // Establish a cold baseline; closes only this dedicated context.
-    observer=spawn('powershell.exe',['-NoProfile','-File',path.join(root,'scripts/observe.ps1'),'-RootPid',String(transport.pid),'-OutputPath',rawPath,'-StopPath',stopPath],{windowsHide:true,stdio:['ignore','pipe','pipe']});
+    observer=spawn('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',path.join(root,'scripts/observe.ps1'),'-RootPid',String(transport.pid),'-OutputPath',rawPath,'-StopPath',stopPath],{windowsHide:true,stdio:['ignore','pipe','pipe']});
     let observerErr=''; observer.stderr.on('data',d=>observerErr+=d);
     observerDone=new Promise((resolve,reject)=>{observer.on('error',reject);observer.on('close',c=>c===0?resolve():reject(new Error(observerErr||`Observer ${c}`)));});
     observerDone.catch(()=>{});
@@ -148,7 +151,7 @@ if(process.argv.includes('--stdio')) {
   const proxy=new Server({name:'shikigami',version:'0.1.0'},{capabilities:{tools:{}},instructions:'Shikigami controls an isolated, headless Google Chrome, without host mouse or keyboard input. Use only this server\'s browser tools for Shikigami work. Call shikigami_workspace for the observer URL; do not open it unless the user wants to watch. Keep at most three tabs. Screenshots without filename are also shown in the observer. Close the dedicated browser when finished. Windows desktop apps are not supported; do not silently switch to desktop computer-use.'});
   const workspaceTool={name:'shikigami_workspace',description:'Get the local observer URL and isolation limits for this AI browser. Does not open a window.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,openWorldHint:false}};
   proxy.setRequestHandler(ListToolsRequestSchema,async()=>({tools:[workspaceTool,...exposedTools]}));
-  proxy.setRequestHandler(CallToolRequestSchema,async r=>exclusive(async()=>{if(r.params.name==='shikigami_workspace')return {content:[{type:'text',text:JSON.stringify({panel:session.panel,headless:true,profile:'isolated ephemeral',desktopApps:false,preview:'Call browser_take_screenshot without filename, then open the panel only when requested.'})}]};if(!exposedTools.some(t=>t.name===r.params.name))throw new Error('Tool not exposed');const result=await call(r.params.name,r.params.arguments); const im=result.content?.find(x=>x.type==='image');if(im)latestImage=Buffer.from(im.data,'base64');return result;}));
+  proxy.setRequestHandler(CallToolRequestSchema,async r=>exclusive(async()=>{if(r.params.name==='shikigami_workspace')return {content:[{type:'text',text:JSON.stringify({panel:session.panel,headless:true,profile:'isolated ephemeral',desktopApps:false,preview:'Call browser_take_screenshot without filename, then open the panel only when requested.'})}]};if(!exposedTools.some(t=>t.name===r.params.name))throw new Error('Tool not exposed');if(r.params.arguments&&'filename' in r.params.arguments)throw new Error('filename is not supported; results are returned inline');const result=await call(r.params.name,r.params.arguments); const im=result.content?.find(x=>x.type==='image');if(im)latestImage=Buffer.from(im.data,'base64');return result;}));
   await proxy.connect(new StdioServerTransport());
   process.stdin.on('end',shutdown);
 }

@@ -62,13 +62,26 @@ try{
   await page.setViewportSize({width:1366,height:768});
   await page.screenshot({path:path.join(root,'artifacts','app-small-desktop.png'),fullPage:true});
   assert(!await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),'Desktop horizontal overflow');
+  // The URL handed to the AI is view-only: no connection, verification or settings pages, and no resume.
+  const viewer=await browser.newPage({viewport:{width:1440,height:1000}});
+  viewer.on('pageerror',error=>errors.push(error.message));
+  await viewer.goto(session.view);
+  await viewer.getByText('これは確認用の画面です',{exact:false}).waitFor();
+  for(const name of ['connect','verify','settings'])assert(!await viewer.locator(`[data-page="${name}"]`).isVisible(),name);
+  assert(!await viewer.locator('#connect-callout').isVisible());
+  await viewer.locator('#stop:not([disabled])').click();
+  await viewer.getByText('再開はShikigamiアプリから行えます。',{exact:true}).waitFor();
+  assert(!await viewer.locator('#resume').isVisible());
+  await viewer.screenshot({path:path.join(root,'artifacts','app-view-only.png'),fullPage:true});
+  await viewer.close();
+  await api('resume',{});
   await api('run',{seconds:5,mode:'automatic'});
   for(let i=0;i<200;i++){await new Promise(r=>setTimeout(r,250));const s=await api('status');if(!s.diagnosticRunning){assert(s.lastReport?.success,JSON.stringify(s.lastReport));assert(s.lastReport.assertions>=9);break;}if(i===199)throw new Error('Diagnostic timed out');}
   await client.close();
   await api('shutdown',{});
   await page.getByText('アプリに接続できません',{exact:true}).waitFor();
   assert.deepEqual(errors,[]);
-  const result={ok:true,connectionFlow:true,isolatedConfig:true,previewShowHide:true,stopResume:true,mobile:true,diagnostic:true,offline:true,humanConcurrencySimulated:false};
+  const result={ok:true,connectionFlow:true,isolatedConfig:true,previewShowHide:true,stopResume:true,viewOnlyPanel:true,mobile:true,diagnostic:true,offline:true,humanConcurrencySimulated:false};
   await fs.writeFile(path.join(root,'artifacts','ui-check.json'),JSON.stringify(result,null,2));
   console.log(JSON.stringify(result));
-}finally{await client.close().catch(()=>{});await browser.close();await api('shutdown',{}).catch(()=>{});}
+}finally{await client.close().catch(()=>{});await browser.close();await api('shutdown',{}).catch(()=>{});await new Promise(r=>setTimeout(r,500));await fs.rm(data,{recursive:true,force:true,maxRetries:5,retryDelay:200}).catch(()=>{});}

@@ -28,7 +28,7 @@ Shikigamiはブラウザの操作経路とプロファイルを分けます。�
 
 以下の配布ZIPはブラウザ専用です。Linuxデスクトップの試作は[ソース版の準備手順](docs/DESKTOP_LAB.md)を参照してください。
 
-[Windows版ダウンロード](https://github.com/ukitako1030/Shikigami/releases/tag/v0.1.0-alpha.1)から`Shikigami-windows-x64.zip`を取得します。
+[Windows版ダウンロード](https://github.com/ukitako1030/Shikigami/releases/tag/v0.1.0-alpha.2)から`Shikigami-windows-x64.zip`を取得します。
 
 1. ZIPを**すべて展開**し、`Shikigami.exe`を開きます。
 2. 「インストールする」を押し、以後はスタートメニューの**Shikigami**から起動します。
@@ -39,7 +39,7 @@ Google Chromeが必要です。Nodeランタイムは同梱しています。ア
 
 この配布物は未署名のアルファ版です。ビルド・同梱ランタイム・ソース上の主要導線は確認していますが、インストーラーの実行は検証環境の承認ポリシーで拒否されたため、実機の導入・削除は未確認です。一般向け安定版ではありません。
 
-アプリは`%LOCALAPPDATA%\Shikigami\app`、作業データは`%LOCALAPPDATA%\Shikigami\data`に置く設計です。アンインストール後も作業データとCodex接続設定は残るため、不要な接続はCodexの設定から削除してください。更新・削除時はShikigamiと、そのMCP接続を終了してください。
+アプリは`%LOCALAPPDATA%\Shikigami\app`、作業データは`%LOCALAPPDATA%\Shikigami\data`に置く設計です。アンインストール後も作業データとCodex接続設定は残るため、不要な接続はCodexの設定から削除してください。更新・削除の前に、ShikigamiとShikigamiを使っているCodexを終了してください。ファイルが使用中の場合、インストーラーは何も変更せずに中止します。
 
 ## ソースから起動する
 
@@ -66,11 +66,11 @@ npm start
 
 `codex mcp get shikigami --json`で登録を確認できます。MCPがサーバーを起動するため、通常利用時は`npm start`を別途実行する必要はありません。既存チャットでツールが見つからない場合は、MCP接続を再読込して新しいチャットを使います。[公式OpenAIドキュメント](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 
-設定例は書き込み扱いの操作に承認を求めます。非対話クライアントが`approval_policy = "never"`の場合、操作が拒否されることがあります。必要な自動承認は利用者が自身の設定で選びます。個人用の承認設定はリポジトリに含めていません。
+アプリの「AIを接続」は、利用者が同意のチェックを入れた後、専用Chromeの基本ツールを自動承認として登録します。手動の設定例は書き込み扱いの操作ごとに承認を求めます。非対話クライアントが`approval_policy = "never"`の場合、操作が拒否されることがあります。必要な自動承認は利用者が自身の設定で選びます。個人用の承認設定はリポジトリに含めていません。
 
-`shikigami_workspace`は確認ページのURLを返します。`browser_take_screenshot`を**filenameなし**で呼ぶと画像がMCP応答と確認ページへ届きます。作業が終わったら`browser_close`を使います。普段のChromeのCookieやパスワードは共有しません。
+`shikigami_workspace`は**確認専用**のページURLを返します。このページでは画面の確認と作業の停止だけができ、接続設定や再開はできません。`browser_take_screenshot`の画像はMCP応答と確認ページへ届きます。ファイルへの保存（`filename`の指定）は受け付けません。作業が終わったら`browser_close`を使います。普段のChromeのCookieやパスワードは共有しません。
 
-同じデータ保存先に接続するアプリとMCPは、1つの専用Chromeを共有します。命令は順番に処理されます。複数AIの仕事を意味的に分離する機能はまだないため、初期版では1つの作業を1つのAIから依頼してください。別セッションが通常のWindows computer-useを使っている場合、その操作はShikigamiへ自動転送されません。
+同じデータ保存先に接続するアプリとMCPは、1つの専用Chromeを共有します。保存先は既定で`%LOCALAPPDATA%Shikigamidata`で、配布版・ソース版・手動設定で共通です。命令は順番に処理されます。複数AIの仕事を意味的に分離する機能はまだないため、初期版では1つの作業を1つのAIから依頼してください。別セッションが通常のWindows computer-useを使っている場合、その操作はShikigamiへ自動転送されません。
 
 ## 実測した範囲
 
@@ -97,20 +97,20 @@ Chromeを含む専用Linuxプロセス群の一標本はPSS 624.6MiB、10秒デ�
 npm test
 ```
 
-SDKによるMCP接続、日本語フォーム入力・クリック、画像応答、非公開ツールの拒否、確認APIのアクセス制御を確認します。LLM呼び出しはありません。
+Codexと同じ経路（`src/mcp.mjs`）でMCPに接続し、日本語フォーム入力・クリック、画像応答、非公開ツールとファイル保存引数の拒否、確認専用URLの権限、確認APIのアクセス制御、Codex設定の書き換え処理を一時フォルダーで確認します。LLM呼び出しはありません。
 
 - `npm run test:shared`：2つのMCP接続が同じChromeを参照すること、操作中の停止、待機命令の破棄、再開、設定保存を独立したテスト領域で確認。
-- `npm run test:ui`：接続・プレビュー・停止・再開・診断・切断・PC／モバイル表示を確認。実際の人間の同時操作を代行した結果ではありません。
+- `npm run test:ui`：接続・プレビュー・停止・再開・確認専用画面・診断・切断・PC／モバイル表示を確認。実際の人間の同時操作を代行した結果ではありません。
 - `npm run test:codex`：保存済み設定とインストール済みCodex CLIを使う実モデル試験。**Codex利用枠を消費します。** クライアント既定のモデルを使い、`SHIKIGAMI_TEST_MODEL`で変更できます。
 - `npm run test:desktop`：WSL 2 / Ubuntu 22.04に必要なパッケージを導入した環境で、専用LinuxデスクトップのMCP・画面・成果物・停止と再起動を確認。準備は[専用手順](docs/DESKTOP_LAB.md)を参照してください。
 - CLIが見つからない場合、`SHIKIGAMI_CODEX_CLI`に`codex.exe`または`bin/codex.js`の絶対パスを指定してください。`node scripts/verify-codex.mjs --check-cli`はモデルを呼ばずにCLI検出だけを確認します。
 
 ## データと制限
 
-- `.runtime/`には接続トークン、`artifacts/`には画面画像・操作ログ・実測データ等を保存します。いずれもGit対象外です。共有前に中身を確認してください。
+- 接続トークン・画面画像・診断結果は`%LOCALAPPDATA%Shikigamidata`に保存します。テストはリポジトリ内の`.runtime/`と`artifacts/`にも結果を書きます。いずれもGit対象外です。共有前に中身を確認してください。
 - 人間の入力文章は取得せず、イベント種別・時刻を記録します。OS監視はマウス座標・前面ウィンドウ識別子・AI側プロセスのメモリを読み取ります。他アプリ本文、キー入力フック、クリップボードは取得しません。
-- 確認APIは127.0.0.1へのバインド、ランダムトークン、Host／Origin確認を使います。同じWindowsユーザー内のプロセスを分離する仕組みではありません。
-- サーバーの任意コード実行、ページ内JavaScript実行、ファイルアップロード／ドロップ、ダイアログ応答はMCPの公開対象外です。
+- 確認APIは127.0.0.1へのバインド、ランダムトークン、Host／Origin確認を使います。AIに渡す確認URLの鍵は表示・停止専用で、接続設定などに使う管理用の鍵とは別です。同じWindowsユーザー内のプロセスを分離する仕組みではありません。
+- サーバーの任意コード実行、ページ内JavaScript実行、ファイルアップロード／ドロップ、ダイアログ応答、ファイルへの保存（`filename`）はMCPの公開対象外です。専用Chromeの操作サービスは空の作業フォルダーで動き、アプリのファイルに書き込めません。
 - CAPTCHA、passkey、Windows Hello、拡張、DRM、音声・カメラ、ネイティブダイアログ、長時間動作、スリープ復帰は未検証です。
 - タブ数の強制上限、クラッシュ後のMCP自動再接続、永続ログインは未実装です。当面は3タブ程度で運用してください。
 

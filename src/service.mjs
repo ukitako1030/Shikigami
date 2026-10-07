@@ -3,14 +3,16 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { codexConfigPath, upsertCodexServer } from './codex-config.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dataDir = path.resolve(process.env.SHIKIGAMI_DATA_DIR || path.join(root, '.runtime'));
-const artifactDir = path.resolve(process.env.SHIKIGAMI_DATA_DIR ? path.join(dataDir, 'artifacts') : path.join(root, 'artifacts'));
+// The app, `npm run start:service` and a manually configured MCP client must share one service and one Chrome.
+export const dataDir = path.resolve(process.env.SHIKIGAMI_DATA_DIR || path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Shikigami', 'data'));
+const artifactDir = path.join(dataDir, 'artifacts');
 const sessionFile = path.join(dataDir, 'session.json');
 const lockFile = path.join(dataDir, 'startup.lock');
 const allowed = new Set([
@@ -22,6 +24,19 @@ const allowed = new Set([
   'browser_take_screenshot','browser_snapshot','browser_click','browser_drag','browser_hover',
   'browser_select_option','browser_tabs','browser_wait_for'
 ]);
+// Playwright MCP writes to disk when a tool receives `filename`. Results are returned inline instead, so an AI
+// steered by a web page cannot overwrite files such as Shikigami's own source.
+const blockedArguments = new Set(['filename']);
+function withoutBlockedArguments(tool) {
+  const schema = tool.inputSchema ?? {type:'object'};
+  const properties = Object.fromEntries(Object.entries(schema.properties ?? {}).filter(([key]) => !blockedArguments.has(key)));
+  const required = schema.required?.filter(key => !blockedArguments.has(key));
+  return {...tool, inputSchema:{...schema, properties, ...(required ? {required} : {})}};
+}
+function sameSecret(value, secret) {
+  if (typeof value !== 'string' || value.length !== secret.length) return false;
+  return timingSafeEqual(Buffer.from(value), Buffer.from(secret));
+}
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const fileExists = async file => fs.stat(file).then(() => true, () => false);
@@ -95,44 +110,27 @@ function connectionConfig(approve=false) {
   if(approve)for(const name of ['shikigami_workspace',...allowed])section+=`\n[mcp_servers.shikigami.tools.${name}]\napproval_mode = "approve"\n`;
   return section;
 }
-async function connectCodex(session) {
-  const config = path.resolve(process.env.SHIKIGAMI_CODEX_CONFIG || path.join(process.env.CODEX_HOME || path.join(os.homedir(),'.codex'),'config.toml'));
-  await fs.mkdir(path.dirname(config), {recursive:true});
-  for (let attempt=0; attempt<3; attempt++) {
-    const original = await fs.readFile(config, 'utf8').catch(error => { if (error.code==='ENOENT') return ''; throw error; });
-    const section = connectionConfig(true);
-    const lines = original.split(/\r?\n/);
-    let inOwnSection = false;
-    const preserved=[];
-    for (const line of lines) {
-      const match = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
-      if (match) {const name=match[1].replace(/["'\s]/g,'');inOwnSection = name === 'mcp_servers.shikigami' || name.startsWith('mcp_servers.shikigami.');}
-      if (!inOwnSection) preserved.push(line);
-    }
-    const updated = `${preserved.join('\n').trimEnd()}\n\n${section}`;
-    if (original.replace(/\r\n/g,'\n') === updated) return {ok:true,updated:false,config,requiresReload:true};
-    const latest = await fs.readFile(config,'utf8').catch(error => { if(error.code==='ENOENT') return ''; throw error; });
-    if (createHash('sha256').update(latest).digest('hex') !== createHash('sha256').update(original).digest('hex')) continue;
-    const backup=original?`${config}.shikigami-backup-${Date.now()}`:null;
-    if (backup) await fs.writeFile(backup, original, {flag:'wx'});
-    const temporary = `${config}.shikigami-${process.pid}-${randomBytes(4).toString('hex')}.tmp`;
-    try { await fs.writeFile(temporary,updated,{flag:'wx'});if(await fs.readFile(config,'utf8').catch(e=>{if(e.code==='ENOENT')return '';throw e;})!==original)continue;await fs.rename(temporary,config); }
-    finally { await fs.unlink(temporary).catch(()=>{}); }
-    return {ok:true,updated:true,config,backup,requiresReload:true};
-  }
-  throw Object.assign(new Error('設定ファイルが同時に更新されています。再試行してください'),{status:409});
+function connectCodex() {
+  return upsertCodexServer({server:'shikigami', section:connectionConfig(true), backupTag:'shikigami'});
 }
 
 async function serve() {
   await fs.mkdir(dataDir,{recursive:true});
   await fs.mkdir(artifactDir,{recursive:true});
+  // The admin token stays with the app window and the MCP adapter. The AI only ever sees the view token, so
+  // even if it opens the panel in its own browser it cannot change Codex settings or answer for the human.
   const token = randomBytes(24).toString('hex');
+  const viewToken = randomBytes(24).toString('hex');
   const instanceId = randomBytes(16).toString('hex');
+  // Playwright MCP may only touch its own empty folders, never the app directory.
+  const browserWorkspace = path.join(dataDir, 'browser-workspace'), browserOutput = path.join(dataDir, 'browser-output');
+  await fs.mkdir(browserWorkspace,{recursive:true});
+  await fs.mkdir(browserOutput,{recursive:true});
   const upstream = new Client({name:'shikigami-shared',version:'1.0.0'});
-  const transport = new StdioClientTransport({command:process.execPath,args:[path.join(root,'node_modules/@playwright/mcp/cli.js'),'--headless','--browser','chrome','--isolated','--caps','vision','--viewport-size','1100x740','--timeout-settle','50','--idle-timeout','120000','--output-dir',artifactDir],cwd:root,stderr:'pipe'});
+  const transport = new StdioClientTransport({command:process.execPath,args:[path.join(root,'node_modules/@playwright/mcp/cli.js'),'--headless','--browser','chrome','--isolated','--caps','vision','--viewport-size','1100x740','--timeout-settle','50','--idle-timeout','120000','--output-dir',browserOutput,'--output-max-size',String(50*1024*1024)],cwd:browserWorkspace,stderr:'pipe'});
   await upstream.connect(transport);
   const allTools = (await upstream.listTools()).tools;
-  const tools = allTools.filter(tool => allowed.has(tool.name));
+  const tools = allTools.filter(tool => allowed.has(tool.name)).map(withoutBlockedArguments);
   const workspaceTool={name:'shikigami_workspace',description:'専用Chromeの接続状態と確認画面URLを取得します。画面は開きません。',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,openWorldHint:false}};
   let latestImage=null, lastCaptureAt=null, lastReport=null, busy=false, diagnosticRunning=false, progress='待機中', runId=null, stopped=false, browserOpen=false, lastBrowserUse=0, lastAgentActivity=null, activity=Date.now(), closing=false;
   const agents=new Map();
@@ -146,8 +144,9 @@ async function serve() {
   const status=()=>({busy,diagnosticRunning,progress,runId,lastReport,hasImage:!!latestImage,lastCaptureAt,agentConnections:[...agents.values()].filter(t=>Date.now()-t<90000).length,lastAgentActivity,browserOpen:browserOpen && Date.now()-lastBrowserUse<120000,stopped});
   let base, session;
   async function callTool(name,args={}) {
-    if (name === 'shikigami_workspace') return textResult(JSON.stringify({panel:session.panel,headless:true,profile:'isolated ephemeral',desktopApps:false,preview:'browser_take_screenshot を filename なしで呼んだ後、利用者が希望した場合だけ確認画面を開きます。'}));
+    if (name === 'shikigami_workspace') return textResult(JSON.stringify({panel:session.view,headless:true,profile:'isolated ephemeral',desktopApps:false,preview:'browser_take_screenshot を呼んだ後、利用者が希望した場合だけ確認画面を案内します。'}));
     if (!allowed.has(name) || !tools.some(tool=>tool.name===name)) return toolError('この操作は Shikigami で許可されていません');
+    if (Object.keys(args).some(key=>blockedArguments.has(key))) return toolError('filename は使えません。filename を付けずに呼び出すと、結果をそのまま返します');
     if (stopped) return toolError('AIブラウザーは停止中です。Shikigami アプリから再開してください');
     const calledAt = epoch;
     return serialized(async()=>{
@@ -216,7 +215,7 @@ async function runDiagnostic(seconds=30, mode='automatic') {
   let observer, observerDone, started=Date.now(), cycles=0, assertions=0, error=null;
   try {
     await call('browser_close'); // Establish a cold baseline; closes only this dedicated context.
-    observer=spawn('powershell.exe',['-NoProfile','-File',path.join(root,'scripts/observe.ps1'),'-RootPid',String(transport.pid),'-OutputPath',rawPath,'-StopPath',stopPath],{windowsHide:true,stdio:['ignore','pipe','pipe']});
+    observer=spawn('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',path.join(root,'scripts/observe.ps1'),'-RootPid',String(transport.pid),'-OutputPath',rawPath,'-StopPath',stopPath],{windowsHide:true,stdio:['ignore','pipe','pipe']});
     let observerErr=''; observer.stderr.on('data',d=>observerErr+=d);
     observerDone=new Promise((resolve,reject)=>{observer.on('error',reject);observer.on('close',c=>c===0?resolve():reject(new Error(observerErr||`Observer ${c}`)));});
     observerDone.catch(()=>{});
@@ -258,8 +257,11 @@ async function runDiagnostic(seconds=30, mode='automatic') {
       browserOpen=false; latestImage=null; busy=false; progress='停止中';
     });
   }
+  // The view page (given to the AI) can watch the screen and stop work; everything else needs the admin token.
+  const viewRoutes=new Set(['GET /api/status','POST /api/capture','GET /api/preview','POST /api/stop']);
   const server=http.createServer(async(req,res)=>{
     res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');
+    res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');res.setHeader('Content-Security-Policy',"frame-ancestors 'none'");
     try {
       if(req.headers.host!==new URL(base).host) return json(res,403,{error:'invalid host'});
       if(req.headers.origin && req.headers.origin!==base) return json(res,403,{error:'invalid origin'});
@@ -268,20 +270,25 @@ async function runDiagnostic(seconds=30, mode='automatic') {
         const image=await fs.readFile(path.join(root,'src','assets','shikigami-spirit.png'));
         return res.writeHead(200,{'Content-Type':'image/png'}).end(image);
       }
-      if(req.method==='GET' && url.pathname===`/panel/${token}`) {
-        res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'}).end((await fs.readFile(path.join(root,'src','panel.html'),'utf8')).replaceAll('__TOKEN__',token)); return;
+      const page=req.method==='GET' && /^\/(panel|view)\/([a-f0-9]{48})$/.exec(url.pathname);
+      if(page && sameSecret(page[2],page[1]==='panel'?token:viewToken)) {
+        const role=page[1]==='panel'?'admin':'view';
+        res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'}).end((await fs.readFile(path.join(root,'src','panel.html'),'utf8')).replaceAll('__TOKEN__',page[2]).replaceAll('__ROLE__',role)); return;
       }
       if(req.method==='GET' && /^\/fixture\/\d+$/.test(url.pathname)){res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'}).end(fixture(url.pathname.split('/').pop()));return;}
-      if(req.headers['x-shikigami-token']!==token) return json(res,403,{error:'invalid token'});
+      const presented=req.headers['x-shikigami-token'];
+      const role=sameSecret(presented,token)?'admin':sameSecret(presented,viewToken)?'view':null;
+      if(!role) return json(res,403,{error:'invalid token'});
+      if(role==='view' && !viewRoutes.has(`${req.method} ${url.pathname}`)) return json(res,403,{error:'確認用の画面からは実行できません。Shikigamiアプリから操作してください'});
       activity=Date.now();
       if(req.method==='GET' && url.pathname==='/api/health') return json(res,200,{instanceId,pid:process.pid});
       if(req.method==='GET' && url.pathname==='/api/status') return json(res,200,status());
       if(req.method==='GET' && url.pathname==='/api/tools') return json(res,200,[workspaceTool,...tools]);
-      if(req.method==='GET' && url.pathname==='/api/connection') return json(res,200,{name:'shikigami',command:process.execPath,args:[path.join(root,'src','mcp.mjs')],configToml:connectionConfig(),env:{SHIKIGAMI_DATA_DIR:dataDir},configPath:path.resolve(process.env.SHIKIGAMI_CODEX_CONFIG || path.join(process.env.CODEX_HOME || path.join(os.homedir(),'.codex'),'config.toml')),connected:status().agentConnections>0});
+      if(req.method==='GET' && url.pathname==='/api/connection') return json(res,200,{name:'shikigami',command:process.execPath,args:[path.join(root,'src','mcp.mjs')],configToml:connectionConfig(),env:{SHIKIGAMI_DATA_DIR:dataDir},configPath:codexConfigPath(),connected:status().agentConnections>0});
       if(req.method==='POST' && url.pathname==='/api/connect-codex') {
         const body=await readBody(req);
         if(body.approveBrowserOperations!==true) return json(res,400,{error:'Chrome操作の承認が必要です'});
-        return json(res,200,await connectCodex(session));
+        return json(res,200,await connectCodex());
       }
       if(req.method==='POST' && url.pathname==='/api/mcp/register') {const id=randomBytes(12).toString('hex');agents.set(id,Date.now());lastAgentActivity=Date.now();return json(res,200,{id});}
       if(req.method==='POST' && url.pathname==='/api/mcp/heartbeat') {const body=await readBody(req);if(!agents.has(body.id))return json(res,404,{error:'unknown connection'});agents.set(body.id,Date.now());return json(res,200,{});}
@@ -328,10 +335,14 @@ async function runDiagnostic(seconds=30, mode='automatic') {
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   base=`http://127.0.0.1:${server.address().port}`;
-  session={pid:process.pid,mcpPid:transport.pid,base,token,instanceId,panel:`${base}/panel/${token}`,started:new Date().toISOString(),dataDir};
+  session={pid:process.pid,mcpPid:transport.pid,base,token,instanceId,panel:`${base}/panel/${token}`,view:`${base}/view/${viewToken}`,started:new Date().toISOString(),dataDir};
   await fs.writeFile(sessionFile,JSON.stringify(session,null,2));
   if(process.argv.includes('--serve')) console.log(session.panel);
-  async function shutdown() {if(closing)return;closing=true;await upstream.close().catch(()=>{});server.close();await fs.unlink(sessionFile).catch(()=>{});process.exit(0);}
+  async function shutdown() {
+    if(closing)return;closing=true;await upstream.close().catch(()=>{});server.close();
+    if((await readSession())?.instanceId===instanceId) await fs.unlink(sessionFile).catch(()=>{});
+    process.exit(0);
+  }
   process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);
   setInterval(()=>{
     for(const [id,time] of agents)if(Date.now()-time>90000)agents.delete(id);
