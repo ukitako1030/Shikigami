@@ -22,7 +22,9 @@ namespace ShikigamiWindows {
     private static void Main(string[] args) {
       Application.EnableVisualStyles();
       Application.SetCompatibleTextRenderingDefault(false);
-      string mode = args.Length == 0 ? (Directory.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app")) ? "--install" : "--launch") : args[0];
+      // Only the copy inside the install folder launches the app. Anything else (an extracted ZIP, or the exe
+      // opened straight from inside the ZIP) shows the installer, which explains how to extract when needed.
+      string mode = args.Length == 0 ? (IsInstalledCopy() ? "--launch" : "--install") : args[0];
       try {
         if (mode == "--launch") { Launch(); return; }
         if (mode == "--silent") { InstallPayload(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app")); return; }
@@ -61,6 +63,23 @@ namespace ShikigamiWindows {
       process.Dispose();
     }
 
+    internal static bool IsInstalledCopy() {
+      string here = Path.GetFullPath(AppDomain.CurrentDomain.BaseDirectory).TrimEnd('\\');
+      return String.Equals(here, Path.GetFullPath(AppRoot).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+    }
+    internal const string InUseMessage = "Shikigami のファイルが使用中です。Shikigami と、Shikigami を使っている Codex を終了してから、もう一度お試しください。";
+    // Renaming the folder fails while any program inside it (for example node.exe started by Codex) is running.
+    // Checking this first means an update or uninstall either completes or leaves the old version untouched.
+    internal static string MoveAside(string folder, string label) {
+      string aside = folder + "." + label + "-" + Guid.NewGuid().ToString("N");
+      try { Directory.Move(folder, aside); }
+      catch (IOException) { throw new IOException(InUseMessage); }
+      catch (UnauthorizedAccessException) { throw new IOException(InUseMessage); }
+      return aside;
+    }
+    internal static void DeleteQuietly(string folder) {
+      try { if (Directory.Exists(folder)) Directory.Delete(folder, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
     internal static string Quote(string value) { return "\"" + value.Replace("\"", "\\\"") + "\""; }
     internal static void CheckSafeTree(string root) {
       if (!Directory.Exists(root)) return;
@@ -90,10 +109,22 @@ namespace ShikigamiWindows {
       if (!File.Exists(Path.Combine(payload, "node.exe")) || !File.Exists(Path.Combine(payload, "src", "desktop-launcher.mjs"))) throw new FileNotFoundException("配布物が見つかりません。ZIPをすべて展開してください。");
       VerifyInstallRoot();
       RequestServiceShutdown();
-      Directory.CreateDirectory(AppRoot);
+      Directory.CreateDirectory(ProductRoot);
       Directory.CreateDirectory(DataRoot);
-      CopyTree(payload, AppRoot);
-      File.Copy(Application.ExecutablePath, Path.Combine(AppRoot, "Shikigami.exe"), true);
+      // Copy the new version beside the old one first, then swap folders, so a failure never mixes versions.
+      string staging = AppRoot + ".new-" + Guid.NewGuid().ToString("N");
+      string previous = null;
+      try {
+        CopyTree(payload, staging);
+        File.Copy(Application.ExecutablePath, Path.Combine(staging, "Shikigami.exe"), true);
+        if (Directory.Exists(AppRoot)) previous = MoveAside(AppRoot, "old");
+        Directory.Move(staging, AppRoot);
+      } catch {
+        if (previous != null && !Directory.Exists(AppRoot)) Directory.Move(previous, AppRoot);
+        DeleteQuietly(staging);
+        throw;
+      }
+      if (previous != null) DeleteQuietly(previous);
       CreateShortcut();
       RegisterUninstall();
     }
@@ -158,12 +189,22 @@ namespace ShikigamiWindows {
       try {
         VerifyInstallRoot();
         RequestServiceShutdown();
-        if (Directory.Exists(AppRoot)) Directory.Delete(AppRoot, true);
+        string removing = Directory.Exists(AppRoot) ? MoveAside(AppRoot, "removing") : null;
         if (File.Exists(Shortcut)) File.Delete(Shortcut);
         Registry.CurrentUser.DeleteSubKey(UninstallKey, false);
-        MessageBox.Show("Shikigami を削除しました。\n作業データは次の場所に残しています。\n" + DataRoot, "Shikigami", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        if (removing != null) DeleteQuietly(removing);
+        MessageBox.Show("Shikigami を削除しました。\n作業データは次の場所に残しています。\n" + DataRoot + "\n\nCodex に追加した接続設定は残っています。不要な場合は Codex の設定ファイル（通常は " + Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "config.toml") + "）から [mcp_servers.shikigami] の項目を削除してください。", "Shikigami", MessageBoxButtons.OK, MessageBoxIcon.Information);
       } catch (Exception error) {
-        MessageBox.Show("削除できませんでした。アプリを閉じてからやり直してください。\n\n" + error.Message, "Shikigami", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        MessageBox.Show("削除できませんでした。\n\n" + error.Message, "Shikigami", MessageBoxButtons.OK, MessageBoxIcon.Error);
+      } finally {
+        string self = Application.ExecutablePath;
+        if (self.StartsWith(Path.GetTempPath(), StringComparison.OrdinalIgnoreCase)) {
+          // The temporary uninstaller cannot delete itself while running; ask cmd to remove it shortly after exit.
+          ProcessStartInfo cleanup = new ProcessStartInfo("cmd.exe", "/d /c ping -n 3 127.0.0.1 >nul & del /f /q " + Quote(self));
+          cleanup.UseShellExecute = false;
+          cleanup.CreateNoWindow = true;
+          try { Process.Start(cleanup); } catch (Win32Exception) { }
+        }
       }
     }
   }
@@ -230,7 +271,7 @@ namespace ShikigamiWindows {
         action.Enabled = true;
         if (a.Error != null) {
           detail.Text = "インストールできませんでした。";
-          note.Text = "アプリを閉じてから、もう一度お試しください。";
+          note.Text = "以前のバージョンはそのまま残っています。";
           MessageBox.Show(a.Error.Message, "Shikigami", MessageBoxButtons.OK, MessageBoxIcon.Error);
           return;
         }
